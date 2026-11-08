@@ -10,6 +10,7 @@ CommerceMind 是面向电商客服场景的多 Agent 应用，提供通用咨询
 
 - [x] 仓库骨架、依赖清单、环境变量模板、测试配置
 - [x] 最小 LLM 对话链路（`/health`、`/chat`）
+- [x] 最小 Docker 镜像（只启动 app）
 - [ ] 基础工具、鉴权与会话并发控制
 - [ ] 意图识别、Skills 动态加载
 - [ ] 工具管理、知识库 RAG、MCP
@@ -135,6 +136,49 @@ pytest -q tests/test_chat_api.py
 
 测试全部使用 mock，不需要真实 Key，也不会访问模型接口。
 
+## Docker
+
+当前只容器化 app 本身，不启动 Redis、ChromaDB、Nginx 和 Prometheus。
+
+### 构建并启动
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f commercemind
+```
+
+镜像构建慢时，可以指定 pip 镜像源：
+
+```bash
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
+```
+
+### 验证
+
+```bash
+curl -s http://127.0.0.1:8000/health | python -m json.tool
+curl -i -X POST http://127.0.0.1:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message": "退款一般多久到账？"}'
+```
+
+没有配置 `ANTHROPIC_API_KEY` 时，`/health` 返回 `degraded`，`/chat` 返回 503，但容器可以正常启动。
+
+### 常用命令
+
+```bash
+docker compose stop        # 停止容器，保留镜像
+docker compose down        # 停止并删除容器
+docker compose up -d --build commercemind   # 改代码后重建
+```
+
+`.env` 通过 Compose 注入容器，不会打进镜像。修改 `.env` 后需要重建容器：
+
+```bash
+docker compose up -d --force-recreate commercemind
+```
+
 ### 当前阶段不包含
 
 - Redis 会话记忆
@@ -142,6 +186,5 @@ pytest -q tests/test_chat_api.py
 - 知识库 RAG 和工具调用
 - MCP
 - 评测与监控
-- Docker 部署
 
 配置项说明见 [.env.example](.env.example)。
