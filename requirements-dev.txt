@@ -1,3 +1,5 @@
 -r requirements.txt
 pytest>=8.4,<10
 pytest-asyncio>=0.25,<2
+# 内存版 Redis，用于短期记忆单元测试；不依赖真实 Redis 服务。
+fakeredis>=2.26,<3

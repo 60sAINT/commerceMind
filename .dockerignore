@@ -1,0 +1,13 @@
+# 构建上下文排除项
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.env
+data/chroma
+logs
+.idea
+.vscode
+.DS_Store

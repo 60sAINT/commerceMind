@@ -1,5 +1,11 @@
-# CommerceMind 最小运行镜像
-# 当前只包含 FastAPI + LLM 客户端，不安装 Redis、ChromaDB、MCP 等尚未使用的依赖。
+# CommerceMind 运行镜像
+#
+# 镜像内包含：
+#   - FastAPI 应用
+#   - Redis Python 客户端与 ChromaDB Python 客户端
+#
+# Redis 服务端和 ChromaDB 服务端由 docker-compose 单独提供；
+# 应用镜像本身不启动这两个服务。
 
 FROM python:3.12-slim AS base
 
@@ -26,6 +32,12 @@ RUN useradd --create-home --uid 1000 commercemind
 
 COPY --chown=commercemind:commercemind api ./api
 COPY --chown=commercemind:commercemind core ./core
+COPY --chown=commercemind:commercemind memory ./memory
+COPY --chown=commercemind:commercemind data ./data
+
+# ChromaDB 本地嵌入式模式需要可写目录；连接独立 chromadb 服务时不使用。
+RUN mkdir -p /app/data/chroma && \
+    chown -R commercemind:commercemind /app/data
 
 USER commercemind
 

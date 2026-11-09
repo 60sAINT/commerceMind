@@ -11,6 +11,7 @@ CommerceMind 是面向电商客服场景的多 Agent 应用，提供通用咨询
 - [x] 仓库骨架、依赖清单、环境变量模板、测试配置
 - [x] 最小 LLM 对话链路（`/health`、`/chat`）
 - [x] 最小 Docker 镜像（只启动 app）
+- [x] Redis / ChromaDB 本地编排与健康检查
 - [ ] 基础工具、鉴权与会话并发控制
 - [ ] 意图识别、Skills 动态加载
 - [ ] 工具管理、知识库 RAG、MCP
@@ -138,7 +139,13 @@ pytest -q tests/test_chat_api.py
 
 ## Docker
 
-当前只容器化 app 本身，不启动 Redis、ChromaDB、Nginx 和 Prometheus。
+当前 compose 包含三个服务：
+
+- `commercemind`：FastAPI 应用，宿主机 `8000`
+- `redis`：短期记忆，宿主机 `6379`，AOF 持久化
+- `chromadb`：长期记忆，宿主机 `8001`，数据卷持久化
+
+记忆业务代码尚未接入，但基础设施已经可以单独启动和健康检查。app 不强制依赖 Redis/Chroma 的健康状态，后续由 `COMMERCEMIND_MEMORY_REQUIRED` 控制降级行为。Nginx 和 Prometheus 仍未编排。
 
 ### 构建并启动
 
@@ -154,6 +161,30 @@ docker compose logs -f commercemind
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
 ```
 
+### 只启动 Redis / ChromaDB
+
+如果只想在宿主机运行 FastAPI，可以先单独启动记忆基础设施：
+
+```bash
+docker compose up -d redis chromadb
+docker compose ps
+```
+
+宿主机访问地址：
+
+```text
+Redis:    127.0.0.1:6379
+ChromaDB: http://127.0.0.1:8001
+```
+
+此时 `.env` 里要使用宿主机地址：
+
+```dotenv
+REDIS_URL=redis://:commercemind123@localhost:6379/0
+CHROMA_HOST=localhost
+CHROMA_PORT=8001
+```
+
 ### 验证
 
 ```bash
@@ -161,6 +192,16 @@ curl -s http://127.0.0.1:8000/health | python -m json.tool
 curl -i -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -d '{"message": "退款一般多久到账？"}'
+```
+
+记忆基础设施验证：
+
+```bash
+# Redis
+docker compose exec redis redis-cli -a "$REDIS_PASSWORD" ping
+
+# ChromaDB
+curl -s http://127.0.0.1:8001/api/v1/heartbeat
 ```
 
 没有配置 `ANTHROPIC_API_KEY` 时，`/health` 返回 `degraded`，`/chat` 返回 503，但容器可以正常启动。
@@ -181,7 +222,7 @@ docker compose up -d --force-recreate commercemind
 
 ### 当前阶段不包含
 
-- Redis 会话记忆
+- 记忆业务逻辑（Redis/ChromaDB 基础设施已就绪）
 - 意图识别与 Agent 路由
 - 知识库 RAG 和工具调用
 - MCP

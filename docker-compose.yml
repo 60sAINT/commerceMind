@@ -1,5 +1,11 @@
-# CommerceMind 最小运行环境
-# 只启动当前已实现的 app；Redis、ChromaDB、Nginx、Prometheus 等尚未接入，暂不编排。
+# CommerceMind 本地运行环境
+#
+# 当前编排：
+#   - commercemind：FastAPI 应用
+#   - redis：短期工作记忆、会话状态、摘要与幂等回执
+#   - chromadb：长期情景记忆与用户画像
+#
+# 记忆业务代码尚未接入；本文件先提供可启动、可健康检查的基础设施。
 
 services:
   commercemind:
@@ -15,6 +21,12 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # 容器内固定通过服务名访问 Redis/ChromaDB。
+      # 宿主机直接运行 uvicorn 时，改用 .env 里的 localhost 地址。
+      REDIS_URL: redis://:${REDIS_PASSWORD:-commercemind123}@redis:6379/0
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
@@ -22,3 +34,55 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: commercemind-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-commercemind123}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-commercemind123}
+    ports:
+      # 仅绑定本机，避免 Redis 暴露到局域网。
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  chromadb:
+    # 与 requirements.txt 中的 Python 客户端保持同一版本，避免协议不兼容。
+    image: chromadb/chroma:0.5.23
+    container_name: commercemind-chromadb
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      CHROMA_SERVER_HOST: 0.0.0.0
+      CHROMA_SERVER_HTTP_PORT: "8000"
+    ports:
+      # 宿主机用 8001，避免与 app 的 8000 端口冲突。
+      # 容器内应用仍通过 chromadb:8000 访问。
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  redis_data:
+  chroma_data:
