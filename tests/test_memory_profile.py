@@ -9,12 +9,12 @@ from pydantic import ValidationError
 from memory.longterm import LongTermMemory
 from memory.models import Episode, Turn, memory_identity
 from memory.profile import (Entities, ProfileUpdater, UserProfile, MAX_RESPONSE_CHARS,
-                            merge_profile, parse_profile)
+                            merge_profile, parse_profile, profile_to_embedding_text)
 from memory.store import RedisMemoryStore, PENDING_PROFILES_KEY, PENDING_EPISODES_KEY
 
 
 class Collection:
-    metadata = {"profile_schema": "v1"}
+    metadata = {"profile_schema": "v2", "hnsw:space": "cosine", "embedding_id": "profile-fake:v1"}
     def __init__(self):
         self.rows = {}
         self.fail = False
@@ -29,6 +29,23 @@ class Collection:
         self.writes += 1
         for i, d, m, v in zip(ids, documents, metadatas, embeddings):
             self.rows[i] = (d, m, v)
+
+
+class Embedding:
+    def __init__(self):
+        self.inputs = []
+        self.fail = False
+    def __call__(self, texts):
+        self.inputs.extend(texts)
+        if self.fail:
+            raise RuntimeError("embedding offline 13800138000")
+        return [[1., 0., 0.] for _ in texts]
+
+
+def make_updater(store, collection, extract, **kwargs):
+    kwargs.setdefault("embed", Embedding())
+    kwargs.setdefault("embedding_id", "profile-fake:v1")
+    return ProfileUpdater(store, collection, extract, **kwargs)
 
 
 def episode(user="u", session="s", summary="用户偏好宽松版型"):
@@ -93,7 +110,7 @@ async def test_update_only_after_episode_and_no_model_for_read(store):
     async def extract(prompt):
         calls.append(prompt)
         return '{"preferences":["宽松"]}'
-    c = Collection(); worker = ProfileUpdater(store, c, extract)
+    c = Collection(); worker = make_updater(store, c, extract)
     e = episode()
     assert await worker.update_from_episode(e) == "not_pending"
     assert not calls and not c.rows
@@ -109,7 +126,7 @@ async def test_update_only_after_episode_and_no_model_for_read(store):
     assert await worker.flush_pending() == 1
     assert len(calls) == 1 and c.writes == 1
     row = c.rows["profile:" + memory_identity("u")]
-    assert row[2] == [1.0] and "user_id" not in row[1]
+    assert row[2] == [1., 0., 0.] and "user_id" not in row[1]
 
 
 @pytest.mark.asyncio
@@ -118,7 +135,7 @@ async def test_failure_retry_and_private_data_never_persisted_or_logged(store, c
     async def extract(prompt):
         prompts.append(prompt)
         return '{"preferences":["宽松","手机号13800138000","邮箱a@example.com"]}'
-    c = Collection(); worker = ProfileUpdater(store, c, extract)
+    c = Collection(); worker = make_updater(store, c, extract)
     e = episode(summary="用户喜欢宽松，手机号13800138000，邮箱a@example.com")
     await enqueue(store, e)
     pending_json = await store._client.hget(PENDING_PROFILES_KEY, e.episode_id)
@@ -139,7 +156,7 @@ async def test_failure_retry_and_private_data_never_persisted_or_logged(store, c
 async def test_invalid_model_timeout_and_corrupt_storage_preserve_previous(store):
     async def valid(prompt):
         return '{"preferences":["宽松"]}'
-    c = Collection(); worker = ProfileUpdater(store, c, valid)
+    c = Collection(); worker = make_updater(store, c, valid)
     e = episode(); await enqueue(store, e); await worker.flush_pending()
     before = dict(c.rows)
     second = episode(session="s2"); await enqueue(store, second)
@@ -168,7 +185,7 @@ async def test_concurrent_sessions_read_latest_under_user_lock(store):
         return json.dumps({"preferences": ["宽松" if "宽松" in prompt else "棉质"]})
     # 两个实例共用 Redis，但本地锁不同，验证跨实例 Redis 用户锁。
     other_store = RedisMemoryStore(store._client)
-    a, b = ProfileUpdater(store, c, extract), ProfileUpdater(other_store, c, extract)
+    a, b = make_updater(store, c, extract), make_updater(other_store, c, extract)
     ea, eb = episode(), episode(session="s2", summary="用户偏好棉质")
     await enqueue(store, ea); await enqueue(store, eb)
     assert await asyncio.gather(a.update_from_episode(ea), b.update_from_episode(eb)) == ["updated", "updated"]
@@ -183,7 +200,7 @@ async def test_concurrent_sessions_read_latest_under_user_lock(store):
 async def test_chroma_success_then_redis_ack_failure_recovers_without_second_write(store, monkeypatch):
     async def extract(prompt):
         return '{"preferences":["宽松"]}'
-    c = Collection(); worker = ProfileUpdater(store, c, extract)
+    c = Collection(); worker = make_updater(store, c, extract)
     e = episode(); await enqueue(store, e)
     ack = store.ack_profile
     async def fail(eid):
@@ -204,7 +221,7 @@ async def test_longterm_handoff_only_on_success_and_retry_without_new_episode(st
     replies = iter(['bad json', '{"preferences":["宽松"]}'])
     async def extract(prompt):
         return next(replies)
-    updater = ProfileUpdater(store, pc, extract)
+    updater = make_updater(store, pc, extract)
     m = LongTermMemory(ec, lambda texts: [[1.0] for _ in texts], "fake", profile_updater=updater)
     e = episode()
     await store._client.hset(PENDING_EPISODES_KEY, e.episode_id, json.dumps(e.to_dict()))
@@ -223,7 +240,7 @@ async def test_longterm_handoff_only_on_success_and_retry_without_new_episode(st
 async def test_cancel_keeps_pending(store):
     async def cancel(prompt):
         raise asyncio.CancelledError
-    worker = ProfileUpdater(store, Collection(), cancel)
+    worker = make_updater(store, Collection(), cancel)
     e = episode(); await enqueue(store, e)
     with pytest.raises(asyncio.CancelledError):
         await worker.update_from_episode(e)
@@ -234,7 +251,7 @@ async def test_cancel_keeps_pending(store):
 async def test_previous_receipt_repaired_before_another_episode_overwrites_profile(store, monkeypatch):
     async def extract(prompt):
         return '{"preferences":["宽松"]}'
-    c = Collection(); worker = ProfileUpdater(store, c, extract)
+    c = Collection(); worker = make_updater(store, c, extract)
     ea, eb = episode(), episode(session="second")
     await enqueue(store, ea); await enqueue(store, eb)
     ack = store.ack_profile
@@ -277,11 +294,11 @@ async def test_real_profile_chroma_optional(store):
     client = chromadb.HttpClient(host=os.getenv("CHROMA_HOST", "127.0.0.1"),
         port=int(os.getenv("CHROMA_PORT", "8001")), settings=Settings(anonymized_telemetry=False))
     name = "profile_test_" + uuid.uuid4().hex
-    c = client.create_collection(name, metadata={"profile_schema": "v1"}, embedding_function=None)
+    c = client.create_collection(name, metadata=Collection.metadata, embedding_function=None)
     async def extract(prompt):
         return '{"preferences":["宽松","手机号13800138000"]}'
     try:
-        worker = ProfileUpdater(store, c, extract)
+        worker = make_updater(store, c, extract)
         e = episode(); await enqueue(store, e)
         assert await worker.flush_pending() == 1
         assert (await worker.get_profile("u")).preferences == ["宽松"]
@@ -289,8 +306,29 @@ async def test_real_profile_chroma_optional(store):
         await worker.flush_pending()
         assert c.count() == 1
         raw = c.get(include=["documents", "metadatas", "embeddings"])
-        assert raw["embeddings"].tolist() == [[1.0]]
+        assert raw["embeddings"].tolist() == [[1., 0., 0.]]
         assert "13800138000" not in json.dumps(raw["documents"])
+        own = await worker.search("u", "宽松")
+        assert len(own) == 1 and own[0].user_key == memory_identity("u")
+        other = episode(user="other"); await enqueue(store, other)
+        await worker.flush_pending()
+        matches = await worker.find_similar_users("u", top_k=1)
+        assert len(matches) == 1 and matches[0].user_key == memory_identity("other")
+        assert matches[0].score == pytest.approx(1.)
+        # 实测旧一维 collection 与新三维 collection 的显式迁移。
+        legacy_name = "profile_legacy_test_" + uuid.uuid4().hex
+        legacy = client.create_collection(legacy_name, metadata={"profile_schema": "v1"}, embedding_function=None)
+        try:
+            old = episode(user="legacy-user")
+            legacy.upsert(ids=["profile:" + old.user_key], documents=[json.dumps({
+                "profile": {"preferences": ["棉质"]}, "last_episode_id": old.episode_id})],
+                metadatas=[{"user_key": old.user_key}], embeddings=[[1.0]])
+            worker.legacy_collection = legacy
+            assert await worker.reindex_user("legacy-user")
+            assert (await worker.get_profile("legacy-user")).preferences == ["棉质"]
+            assert legacy.count() == 1 and c.count() == 3
+        finally:
+            client.delete_collection(legacy_name)
     finally:
         client.delete_collection(name)
 
@@ -306,7 +344,7 @@ async def test_cancel_during_write_waits_for_thread_before_unlock(store):
             super().upsert(**kwargs)
     async def extract(prompt):
         return '{"preferences":["宽松"]}'
-    c = SlowCollection(); worker = ProfileUpdater(store, c, extract)
+    c = SlowCollection(); worker = make_updater(store, c, extract)
     e = episode(); await enqueue(store, e)
     task = asyncio.create_task(worker.update_from_episode(e))
     try:
@@ -321,3 +359,172 @@ async def test_cancel_during_write_waits_for_thread_before_unlock(store):
     assert await store.get_pending_profile(e.episode_id)
     assert await worker.update_from_episode(e) == "already_applied"
     assert c.writes == 1
+
+
+def test_semantic_text_only_business_fields_stable_order_and_pii_filter():
+    p = UserProfile(preferences=["宽松", "棉质", "13800138000"],
+                    entities=Entities(products=["运动鞋"], issue_types=["退换货"]))
+    text = profile_to_embedding_text(p)
+    assert text == "长期偏好：宽松；棉质\n关注商品类别：运动鞋\n咨询问题类别：退换货"
+    assert profile_to_embedding_text(UserProfile(preferences=["棉质", "宽松"], entities=p.entities)) == text
+    assert profile_to_embedding_text(UserProfile()) == ""
+    assert "13800138000" not in text
+
+
+@pytest.mark.asyncio
+async def test_embedding_uses_merged_profile_not_patch_or_metadata(store):
+    embed, c = Embedding(), Collection()
+    replies = iter(['{"preferences":["宽松"]}', '{"entities":{"products":["运动鞋"]}}'])
+    async def extract(prompt):
+        return next(replies)
+    worker = make_updater(store, c, extract, embed=embed)
+    for e in [episode(), episode(session="second")]:
+        await enqueue(store, e)
+        assert await worker.update_from_episode(e) == "updated"
+    assert embed.inputs == ["长期偏好：宽松", "长期偏好：宽松\n关注商品类别：运动鞋"]
+    assert all("user_key" not in t and "episode" not in t and "updated_at" not in t for t in embed.inputs)
+    doc, meta, vector = c.rows["profile:" + memory_identity("u")]
+    assert json.loads(doc)["semantic_text"] == embed.inputs[-1]
+    assert meta["embedding_id"] == "profile-fake:v1"
+    assert vector == [1., 0., 0.]
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_keeps_old_and_pending_and_no_secrets_logged(store, caplog):
+    embed, c = Embedding(), Collection()
+    async def extract(prompt):
+        return '{"preferences":["宽松","手机号13800138000"]}'
+    worker = make_updater(store, c, extract, embed=embed)
+    first = episode(); await enqueue(store, first); await worker.flush_pending()
+    before = dict(c.rows)
+    second = episode(session="another"); await enqueue(store, second)
+    embed.fail = True
+    assert await worker.update_from_episode(second) == "failed"
+    assert c.rows == before and await store.get_pending_profile(second.episode_id)
+    assert not await store.profile_applied(second.episode_id)
+    assert "13800138000" not in caplog.text + "".join(embed.inputs)
+    embed.fail = False
+    assert await worker.update_from_episode(second) == "unchanged"
+
+
+@pytest.mark.asyncio
+async def test_empty_profile_no_vector_no_row_but_acknowledged(store):
+    embed, c = Embedding(), Collection()
+    async def extract(prompt):
+        return '{}'
+    worker = make_updater(store, c, extract, embed=embed)
+    e = episode(); await enqueue(store, e)
+    assert await worker.update_from_episode(e) == "unchanged"
+    assert not embed.inputs and not c.rows
+    assert await store.profile_applied(e.episode_id)
+
+
+@pytest.mark.parametrize("vectors", [[[0., 0.]], [[float("nan")]], [[]], []])
+@pytest.mark.asyncio
+async def test_bad_profile_vectors_not_written(store, vectors):
+    async def extract(prompt):
+        return '{"preferences":["宽松"]}'
+    c = Collection(); worker = make_updater(store, c, extract, embed=lambda texts: vectors)
+    e = episode(); await enqueue(store, e)
+    assert await worker.update_from_episode(e) == "failed"
+    assert not c.rows and await store.get_pending_profile(e.episode_id)
+
+
+def test_profile_model_namespace_mismatch_rejected():
+    async def extract(prompt):
+        return '{}'
+    with pytest.raises(ValueError):
+        make_updater(None, Collection(), extract, embedding_id="other")
+    c = Collection(); c.metadata = {"profile_schema": "v1"}
+    with pytest.raises(ValueError):
+        make_updater(None, c, extract)
+
+
+@pytest.mark.asyncio
+async def test_personal_search_and_similar_users_are_separate_and_defensive(store):
+    class QueryCollection(Collection):
+        response = None
+        def query(self, **kwargs):
+            self.query_args = kwargs
+            if self.fail:
+                raise RuntimeError("private 13800138000")
+            return self.response
+    c, embed = QueryCollection(), Embedding()
+    async def extract(prompt):
+        return '{"preferences":["宽松"]}'
+    worker = make_updater(store, c, extract, embed=embed)
+    current, other, low = memory_identity("u"), memory_identity("other"), memory_identity("low")
+    e = episode(); await enqueue(store, e); await worker.flush_pending()
+    doc = c.rows["profile:" + current][0]
+    def meta(key, model="profile-fake:v1"):
+        return {"user_key": key, "embedding_id": model}
+    c.response = {"ids": [["profile:" + key for key in [other, current, low, other]]],
+                  "documents": [[doc]*4], "metadatas": [[meta(other), meta(current), meta(low), meta(other)]],
+                  "distances": [[.1, .2, .9, .1]]}
+    own = await worker.search("u", "电话13800138000，宽松版型")
+    assert [hit.user_key for hit in own] == [current]
+    assert c.query_args["where"] == {"user_key": {"$eq": current}}
+    assert "13800138000" not in embed.inputs[-1]
+    similar = await worker.find_similar_users("u")
+    assert [hit.user_key for hit in similar] == [other]
+    assert c.query_args["where"] == {"user_key": {"$ne": current}}
+    assert similar[0].score == pytest.approx(.9)
+    assert "长期偏好：宽松" == embed.inputs[-1]
+    c.fail = True
+    assert await worker.search("u", "宽松") == []
+    assert await worker.search("u", " ") == []
+    with pytest.raises(ValueError):
+        await worker.find_similar_users("u", top_k=0)
+
+
+@pytest.mark.asyncio
+async def test_legacy_read_and_reindex_do_not_call_llm_or_overwrite_new(store):
+    old, new, embed = Collection(), Collection(), Embedding()
+    e = episode(); key = "profile:" + e.user_key
+    old.rows[key] = (json.dumps({"profile": {"preferences": ["宽松", "手机号13800138000"]},
+                               "last_episode_id": e.episode_id}), {}, [1.0])
+    async def no_llm(prompt):
+        raise AssertionError("migration must not call LLM")
+    worker = make_updater(store, new, no_llm, embed=embed, legacy_collection=old)
+    assert (await worker.get_profile("u")).preferences == ["宽松"]
+    assert not new.rows
+    assert await worker.reindex_user("u")
+    assert new.rows[key][2] == [1., 0., 0.] and old.rows[key][2] == [1.0]
+    assert embed.inputs == ["长期偏好：宽松"]
+    assert not await worker.reindex_user("u")
+    assert not await worker.reindex_user("missing")
+    # 迁移不修改 episode 已处理回执，模型切换后的重建仍可独立进行。
+    assert not await store.profile_applied(e.episode_id)
+
+
+@pytest.mark.asyncio
+async def test_personal_search_rejects_wrong_model_corrupt_doc_and_nan_distance(store):
+    class QueryCollection(Collection):
+        def query(self, **kwargs):
+            key = memory_identity("u")
+            valid = json.dumps({"profile": {"preferences": ["宽松"]}, "last_episode_id": "a"*64})
+            return {"ids": [["profile:"+key]*3], "documents": [[valid, 'bad', valid]],
+                    "metadatas": [[{"user_key": key, "embedding_id": "other"},
+                                   {"user_key": key, "embedding_id": "profile-fake:v1"},
+                                   {"user_key": key, "embedding_id": "profile-fake:v1"}]],
+                    "distances": [[0., .1, float("nan")]]}
+    async def extract(prompt):
+        return '{}'
+    worker = make_updater(store, QueryCollection(), extract)
+    assert await worker.search("u", "宽松") == []
+
+
+def test_shared_embedding_configuration(monkeypatch):
+    from memory.embeddings import embedding_from_env, SiliconFlowEmbedding
+    monkeypatch.setenv("COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER", "auto")
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "fake-test-key")
+    monkeypatch.setenv("COMMERCEMIND_MEMORY_EMBEDDING_MODEL", "BAAI/bge-m3")
+    name, embed = embedding_from_env()
+    assert name == "siliconflow:BAAI/bge-m3" and isinstance(embed, SiliconFlowEmbedding)
+    monkeypatch.setenv("COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER", "siliconflow")
+    monkeypatch.delenv("SILICONFLOW_API_KEY")
+    with pytest.raises(ValueError):
+        embedding_from_env()
+    monkeypatch.setenv("COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER", "unknown")
+    with pytest.raises(ValueError):
+        embedding_from_env()

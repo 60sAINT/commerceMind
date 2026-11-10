@@ -9,27 +9,12 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from memory.embeddings import SiliconFlowEmbedding, embedding_from_env, encode_vectors
 from memory.models import Episode, memory_identity
 from memory.redaction import redact
 from memory.tokens import TokenCounter
 
 logger = logging.getLogger(__name__)
-
-
-class SiliconFlowEmbedding:
-    def __init__(self, key: str, model: str, url: str) -> None:
-        self.key, self.model, self.url = key, model, url
-
-    def __call__(self, texts: list[str]) -> list[list[float]]:
-        import httpx
-        with httpx.Client(timeout=15) as client:
-            response = client.post(self.url, headers={"Authorization": f"Bearer {self.key}"},
-                                   json={"model": self.model, "input": texts, "encoding_format": "float"})
-            response.raise_for_status()
-            data = sorted(response.json()["data"], key=lambda item: item["index"])
-            if [item["index"] for item in data] != list(range(len(texts))):
-                raise ValueError("embedding 响应数量/顺序不合法")
-            return [item["embedding"] for item in data]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,24 +46,7 @@ class LongTermMemory:
     def from_env(cls, *, profile_updater=None) -> LongTermMemory:
         import chromadb
         from chromadb.config import Settings
-        provider = os.getenv("COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER", "auto").strip()
-        key = os.getenv("SILICONFLOW_API_KEY", "").strip()
-        if provider == "auto":
-            provider = "siliconflow" if key else "default"
-        if provider == "siliconflow":
-            if not key:
-                raise ValueError("siliconflow embedding 缺少 Key")
-            model = os.getenv("COMMERCEMIND_MEMORY_EMBEDDING_MODEL", "BAAI/bge-m3")
-            embedding_id = f"siliconflow:{model}"
-            embed = SiliconFlowEmbedding(key, model, os.getenv(
-                "COMMERCEMIND_MEMORY_EMBEDDING_URL", "https://api.siliconflow.cn/v1/embeddings"))
-        elif provider == "default":
-            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-            embedding_id = "chroma:all-MiniLM-L6-v2"
-            function = DefaultEmbeddingFunction()
-            embed = lambda texts: function(texts)
-        else:
-            raise ValueError("embedding provider 只支持 auto/default/siliconflow")
+        embedding_id, embed = embedding_from_env()
         # 不在失败时切换后端；不同模型必须使用不同 collection。
         name = "episodic_" + hashlib.sha256(embedding_id.encode()).hexdigest()[:12]
         client = chromadb.HttpClient(host=os.getenv("CHROMA_HOST", "localhost"),
@@ -97,14 +65,7 @@ class LongTermMemory:
                    min_turns=int(os.getenv("COMMERCEMIND_MEMORY_EPISODE_MIN_TURNS", "2")))
 
     def _vectors(self, texts: list[str]) -> list[list[float]]:
-        vectors = self._embed(texts)
-        if len(vectors) != len(texts):
-            raise ValueError("embedding 数量不符")
-        result = [[float(x) for x in row] for row in vectors]
-        if not result or not result[0] or any(len(row) != len(result[0]) or
-                any(not math.isfinite(x) for x in row) or not any(row) for row in result):
-            raise ValueError("embedding 无效")
-        return result
+        return encode_vectors(self._embed, texts)
 
     async def add_episode(self, episode: Episode) -> bool:
         if episode.turn_count < self.min_turns:

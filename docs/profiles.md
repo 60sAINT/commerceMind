@@ -39,7 +39,7 @@ working memory 达阈值
   → Redis 同一事务：删除 episode 待办、登记画像待办
   → LLM 从本次脱敏 episode 提取 JSON 增量
   → Pydantic 校验 + 敏感项过滤
-  → 用户级锁内读取最新画像、合并、保存
+  → 用户级锁内读取最新画像、合并、生成真实向量、保存
   → Redis 同一事务：记录处理回执、删除画像待办
 ```
 
@@ -52,8 +52,9 @@ working memory 达阈值
 | `profile.py`：`UserProfile` / `Entities` | 偏好、商品类别、问题类别 | Pydantic 数据结构，不连接数据库 |
 | `parse_profile(raw)` | 模型响应字符串 | 清洗后的 UserProfile；非法格式抛错 |
 | `sanitize_profile(profile)` | 画像对象 | 去空白、规范化、去重、过滤已知敏感项后的新对象 |
+| `profile_to_embedding_text(profile)` | 合并清洗后的画像 | 固定顺序的语义文本，不含身份、时间及来源编号 |
 | `merge_profile(old, patch)` | 旧画像、合法增量 | 有界、去重的新画像；纯函数，不调用 LLM |
-| `ProfileUpdater.from_env(store, extract)` | Redis store、异步抽取函数及 Chroma 环境变量 | 连接独立 `user_profiles_v1` collection 的工具对象 |
+| `ProfileUpdater.from_env(store, extract)` | Redis store、异步抽取函数及 Chroma 环境变量 | 连接按模型区分的 `user_profiles_v2_<模型哈希>` collection 的工具对象 |
 | `extract_profile(episode)` | 本次 episode | LLM 提取并校验的增量；默认超时 15 秒；自己不写库 |
 | `update_from_episode(episode)` | 已登记待办的 episode | `updated / unchanged / already_applied / not_pending / failed` |
 | `get_profile(user_id)` | 原始用户 ID | 按哈希 ID 精确读取；无记录返回空画像；坏数据/连接失败抛错，不假装为空覆盖 |
@@ -74,7 +75,7 @@ working memory 达阈值
 
 ## 存储结构
 
-Chroma collection：`user_profiles_v1`，metadata 为 `{"profile_schema":"v1"}`。每个用户一条，记录 ID 为 `profile:<用户SHA-256>`，与 session 无关。document 是如下 JSON 字符串：
+Chroma collection：`user_profiles_v2_` 加 embedding ID 的 SHA-256 前 12 位，collection metadata 包含 `profile_schema=v2`、`embedding_id` 和 `hnsw:space=cosine`。旧的 `user_profiles_v1` 不修改。每个用户一条，记录 ID 为 `profile:<用户SHA-256>`，与 session 无关。document 是如下 JSON 字符串：
 
 ```json
 {
@@ -85,11 +86,72 @@ Chroma collection：`user_profiles_v1`，metadata 为 `{"profile_schema":"v1"}`�
       "issue_types": ["退换货"]
     }
   },
-  "last_episode_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  "last_episode_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "semantic_text": "长期偏好：偏好宽松版型\n关注商品类别：运动鞋\n咨询问题类别：退换货"
 }
 ```
 
-metadata 包含 `user_key`、`source_episode_id`、`source_created_at` 和 `updated_at`，不保存原始用户 ID。embedding 显式写为 `[1.0]`：它只是 Chroma 必需的占位向量。画像只按 ID 取，不做语义检索，既不调用 bge-m3，也不调用默认模型生成画像向量；它与 episode 的 collection 不可混用。
+metadata 包含 `user_key`、`source_episode_id`、`source_created_at`、`updated_at` 和 `embedding_id`，不保存原始用户 ID。embedding 是 `semantic_text` 经模型编码得到的真实浮点向量；不是 `[1.0]` 占位，也不是 JSON 字符的 token ID。document 保存完整结构化画像，semantic_text 只是确定性的检索表示，不用 LLM 另写一篇描述。
+
+## 什么内容向量化，何时生成
+
+`profile_to_embedding_text(profile)` 输入**本次合并完成且清洗后的完整画像**，将三个字段分别排序后拼成带标签的文本。例如：
+
+```text
+长期偏好：偏好宽松版型；偏好棉质
+关注商品类别：运动鞋
+咨询问题类别：退换货
+```
+
+不包含用户 ID/哈希、session、episode ID、时间戳、处理回执等身份和运维信息。敏感候选在此之前已整项过滤；空画像不生成向量、不创建记录，但任务可以正常确认。
+
+更新链路为：LLM 提取增量 → Python 合并最新旧画像 → 清洗 → 拼 semantic_text → embedding 编码 → 同一次 Chroma upsert 保存 JSON、metadata、向量 → Redis 确认。embedding 失败或向量为空、全零、NaN 等会在写库前失败，旧记录和待办保留。此次仍从 episode.summary 抽取，没有改成裁剪后的 working memory。
+
+`memory/embeddings.py` 统一供画像和 episode 使用，配置沿用 `COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER/MODEL/URL` 及 `SILICONFLOW_API_KEY`：
+
+- `default`：本地 Chroma 默认 embedding，无服务 API 费，首次使用需要下载模型。
+- `siliconflow`：远程模型 API，默认模型名是 `BAAI/bge-m3`，写画像和向量查询均可能产生相应服务费用。
+- `auto`：有 Key 选择远程，无 Key 选择默认本地模型；运行失败不临时切换。仅仅配置模型名字不会安装本地 bge-m3。
+
+这次不修改真实 `.env`，不自动下载模型或批量重建生产画像。返回维度取决于模型；各模型有自己的输入长度限制。当前单向量包含偏好与咨询类别，表达的是综合画像，不保证等同于纯“审美品味”。
+
+## 三种读取方式与上下游
+
+| 方法 | 输入 → 输出 | 是否调用 embedding / 边界 |
+| --- | --- | --- |
+| `get_profile(user_id)` | 用户 ID → UserProfile | 精确读取，不调用；适合回答前加载当前用户完整画像 |
+| `search(user_id, query, min_score=.55)` | 用户 ID、问题 → 最多一条 ProfileMatch | 问题脱敏并编码；只查询当前用户，低相关返回空列表 |
+| `find_similar_users(user_id, top_k=3, min_score=.55)` | 当前用户 → 其他用户的 ProfileMatch 列表 | 当前完整画像编码查询；排除自己，属于显式跨用户后台分析能力 |
+
+`ProfileMatch` 包含 `user_key`、`profile`、`score`。分数为 cosine 的 `1-distance`，不是概率；检索服务失败返回空列表，非法 top-k/阈值会报错。代码还会核对返回用户、记录 ID 和模型，防止查询返回不符合筛选条件的数据。
+
+```python
+# 不需要相关性筛选时，仍然直接读取，零 embedding 调用。
+profile = await profiles.get_profile(user_id)
+
+# 个人记忆按当前问题检索，只返回当前用户画像。
+hits = await profiles.search(user_id, "推荐一双适合我的运动鞋")
+profile_texts = [hit.profile.model_dump() for hit in hits]
+
+# 可信后台业务显式调用；没有开放 HTTP 接口，也不自动传给聊天用户。
+peers = await profiles.find_similar_users(user_id, top_k=3)
+```
+
+这些接口尚未接入 `ContextBuilder` / `/chat`。后续放进 context 的是经过校验的 profile 文字或 JSON，不是 embedding；相似用户的画像不能当成当前用户的个人记忆注入。
+
+## 旧的一维记录和切换模型后怎么办
+
+旧 collection 的一维向量不能混写新维度，因此新建模型隔离的 v2 collection。精确读取优先查当前 v2，缺失时可读配置的来源 collection（默认 `user_profiles_v1`）；向量检索只查询当前模型的新 collection，不会把旧占位向量带进来。
+
+显式迁移一位用户：
+
+```python
+migrated = await profiles.reindex_user(user_id)
+```
+
+它在用户锁内读取旧画像、重新清洗、拼 semantic_text、用当前模型编码并保存到新 collection；不调用 LLM、不重新抽取、不删除旧数据，不修改 episode 回执。当前 collection 已有该用户则跳过，防止旧档案覆盖新档案。迁移失败抛错，旧记录保留；返回 True 表示迁移，False 表示无来源/空画像/已有目标。
+
+切换 embedding 模型后，可在启动前把 `COMMERCEMIND_MEMORY_PROFILE_SOURCE_COLLECTION` 设为上一个模型的 collection 名，再为需要的用户调用此方法。没有迁移的旧用户仍可精确读取，但不会出现在新模型的相似度结果里；后续有新的 episode 更新时，会读旧画像合并后写入新模型 collection。已处理 episode 的回执不会因为切换模型而失效，因此不能靠重放已处理任务来代替迁移。
 
 Redis 新增两个无 TTL 的 Hash：
 
