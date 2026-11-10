@@ -17,3 +17,7 @@ python-dotenv==1.0.1
 # ChromaDB：长期情景记忆与用户画像。
 redis==5.2.1
 chromadb==0.5.23
+
+# 本地官方 tokenizer + 官方消息模板（不依赖 transformers / torch）。
+tokenizers==0.20.3
+Jinja2==3.1.6
