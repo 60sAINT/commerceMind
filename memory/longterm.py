@@ -43,7 +43,7 @@ class EpisodeMatch:
 class LongTermMemory:
     def __init__(self, collection: Any, embed: Callable, embedding_id: str, *,
                  counter: TokenCounter | None = None, top_k: int = 3,
-                 min_score: float = 0.55, max_tokens: int = 600, min_turns: int = 2) -> None:
+                 min_score: float = 0.55, max_tokens: int = 600, min_turns: int = 2, profile_updater=None) -> None:
         for name, value in (("top_k", top_k), ("max_tokens", max_tokens), ("min_turns", min_turns)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} 必须为正整数")
@@ -52,12 +52,13 @@ class LongTermMemory:
         metadata = collection.metadata or {}
         if metadata.get("hnsw:space") != "cosine" or metadata.get("embedding_id") != embedding_id:
             raise ValueError("collection 的距离或 embedding 配置不匹配")
+        self.profile_updater = profile_updater
         self.collection, self._embed, self.embedding_id = collection, embed, embedding_id
         self.counter = counter if counter is not None else TokenCounter()
         self.top_k, self.min_score, self.max_tokens, self.min_turns = top_k, min_score, max_tokens, min_turns
 
     @classmethod
-    def from_env(cls) -> LongTermMemory:
+    def from_env(cls, *, profile_updater=None) -> LongTermMemory:
         import chromadb
         from chromadb.config import Settings
         provider = os.getenv("COMMERCEMIND_MEMORY_EMBEDDING_PROVIDER", "auto").strip()
@@ -89,7 +90,7 @@ class LongTermMemory:
         except InvalidCollectionException:
             collection = client.get_or_create_collection(name, embedding_function=None,
                         metadata={"hnsw:space": "cosine", "embedding_id": embedding_id})
-        return cls(collection, embed, embedding_id,
+        return cls(collection, embed, embedding_id, profile_updater=profile_updater,
                    top_k=int(os.getenv("COMMERCEMIND_MEMORY_RETRIEVAL_TOP_K", "3")),
                    min_score=float(os.getenv("COMMERCEMIND_MEMORY_RETRIEVAL_MIN_SCORE", "0.55")),
                    max_tokens=int(os.getenv("COMMERCEMIND_MEMORY_EPISODE_MAX_TOKENS", "600")),
@@ -165,9 +166,14 @@ class LongTermMemory:
             try:
                 if not await self.add_episode(episode):
                     continue
-                await store.ack_episode(episode.episode_id)
+                await store.ack_episode(episode.episode_id, profile_episode=episode)
                 sent += 1
             except Exception as exc:
                 logger.warning("episode_write_pending error_type=%s", type(exc).__name__)
                 break
+        if self.profile_updater is not None:
+            try:
+                await self.profile_updater.flush_pending(limit)
+            except Exception as exc:
+                logger.warning("profile_flush_failed error_type=%s", type(exc).__name__)
         return sent

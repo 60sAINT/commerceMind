@@ -20,6 +20,8 @@ from memory.models import Episode, MemorySnapshot, Turn
 
 DEFAULT_TTL_S = 7 * 24 * 60 * 60
 PENDING_EPISODES_KEY = "memory:pending_episodes:v1"
+PENDING_PROFILES_KEY = "memory:pending_profiles:v1"
+APPLIED_PROFILES_KEY = "memory:applied_profiles:v1"
 
 
 def _json(value: Any) -> str:
@@ -199,8 +201,47 @@ class RedisMemoryStore:
                 break
         return episodes
 
-    async def ack_episode(self, episode_id: str) -> None:
-        await self._client.hdel(PENDING_EPISODES_KEY, episode_id)
+    async def ack_episode(self, episode_id: str, *, profile_episode: Episode | None = None) -> None:
+        """仅向量写成功后调用；移除 episode 待办与画像交接在同一事务完成。"""
+        if profile_episode is not None and profile_episode.episode_id != episode_id:
+            raise ValueError("episode ID 不一致")
+        payload = None if profile_episode is None else _json(profile_episode.to_dict())
+        async with self._client.pipeline(transaction=True) as pipe:
+            if payload is not None:
+                pipe.hset(PENDING_PROFILES_KEY, episode_id, payload)
+            pipe.hdel(PENDING_EPISODES_KEY, episode_id)
+            await pipe.execute()
+
+    @asynccontextmanager
+    async def profile_lock(self, user_key: str) -> AsyncIterator[None]:
+        if len(user_key) != 64 or any(c not in '0123456789abcdef' for c in user_key):
+            raise ValueError("需要用户哈希")
+        async with self._process_locks.hold("profile:" + user_key):
+            async with redis_lease(self._client, "lock:profile:" + user_key):
+                yield
+
+    async def get_pending_profile(self, episode_id: str) -> Episode | None:
+        raw = await self._client.hget(PENDING_PROFILES_KEY, episode_id)
+        return Episode(**json.loads(raw)) if raw else None
+
+    async def get_pending_profiles(self, limit: int = 20) -> list[Episode]:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit 必须为正整数")
+        result = []
+        async for _, raw in self._client.hscan_iter(PENDING_PROFILES_KEY):
+            result.append(Episode(**json.loads(raw)))
+            if len(result) >= limit:
+                break
+        return result
+
+    async def profile_applied(self, episode_id: str) -> bool:
+        return bool(await self._client.hexists(APPLIED_PROFILES_KEY, episode_id))
+
+    async def ack_profile(self, episode_id: str) -> None:
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.hset(APPLIED_PROFILES_KEY, episode_id, "1")
+            pipe.hdel(PENDING_PROFILES_KEY, episode_id)
+            await pipe.execute()
 
     async def get_state(self, user_id: str, session_id: str) -> dict[str, Any]:
         raw = await self._client.get(self.state_key(user_id, session_id))

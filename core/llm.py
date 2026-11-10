@@ -81,6 +81,11 @@ class LLMClient:
             prompt, system="你是会话摘要器，只输出忠实、简洁的摘要正文。", reject_truncated=True,
         )
 
+    async def extract_profile(self, prompt: str) -> str:
+        """用户画像抽取；独立 JSON 指令，截断输出视为失败。"""
+        return await self._generate(prompt, system="你是用户画像提取器，只输出符合要求的 JSON 对象。",
+                                    reject_truncated=True)
+
     async def _generate(self, message: str, *, system: str, reject_truncated: bool = False) -> str:
         try:
             async with asyncio.timeout(self.settings.timeout_s):
