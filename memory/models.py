@@ -1,4 +1,4 @@
-"""短期记忆数据模型：一轮一个 Turn，外加速度和摘要快照。"""
+"""短期记忆数据模型：一轮一个 Turn，外加状态和摘要快照。"""
 from __future__ import annotations
 
 import json

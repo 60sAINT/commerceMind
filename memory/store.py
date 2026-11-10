@@ -3,7 +3,7 @@
 - 一轮一个 Redis list item，item 内包含 user 和 assistant 两条消息；
 - Redis 中最新在前，读取时还原为时间顺序；
 - commit 在 MULTI/EXEC 中同时写 working memory、state 和 summary，并统一刷新 TTL；
-- 本次不包含压缩，后续压缩流程读取快照后自行处理。
+- 为 compactor 提供一致快照及条件提交；本模块不调用模型生成摘要。
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import redis.asyncio as redis
+from redis.exceptions import WatchError
 
 from memory.locks import KeyedLocks, redis_lease
 from memory.models import MemorySnapshot, Turn
@@ -132,16 +133,55 @@ class RedisMemoryStore:
         *,
         limit: int | None = None,
     ) -> MemorySnapshot:
-        turns = await self.get_turns(user_id, session_id, limit=limit)
-        state_raw, summary = await self._client.mget([
-            self.state_key(user_id, session_id),
-            self.summary_key(user_id, session_id),
-        ])
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("limit 必须是正整数")
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.lrange(self.working_key(user_id, session_id), 0, -1 if limit is None else limit - 1)
+            pipe.mget([self.state_key(user_id, session_id), self.summary_key(user_id, session_id)])
+            raws, (state_raw, summary) = await pipe.execute()
         return MemorySnapshot(
-            turns=tuple(turns),
+            turns=tuple(Turn.from_json(raw) for raw in reversed(raws)),
             state=json.loads(state_raw) if state_raw else {},
             summary=summary or "",
         )
+
+    async def commit_compaction(
+        self, user_id: str, session_id: str, *, snapshot: MemorySnapshot, summary: str,
+    ) -> bool:
+        """条件提交摘要，保留快照最近两轮及生成期间新增的所有轮次。
+
+        snapshot 必须来自未设 limit 的 get_snapshot。不持有长时间会话锁；
+        WATCH 保护检查和提交之间的变化，过期/被裁剪/摘要变化则放弃。
+        """
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("summary 必须是非空字符串")
+        size = len(snapshot.turns)
+        if size <= 2:
+            return False
+        key = self.working_key(user_id, session_id)
+        skey = self.summary_key(user_id, session_id)
+        for _ in range(3):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key, skey)
+                    current = await pipe.lrange(key, 0, -1)
+                    old_summary = await pipe.get(skey) or ""
+                    if len(current) < size or old_summary != snapshot.summary:
+                        return False
+                    original = tuple(Turn.from_json(raw) for raw in reversed(current[-size:]))
+                    if original != snapshot.turns:
+                        return False
+                    keep_count = len(current) - size + 2
+                    pipe.multi()
+                    pipe.setex(skey, self._ttl_s, summary)
+                    pipe.ltrim(key, 0, keep_count - 1)
+                    pipe.expire(key, self._ttl_s)
+                    pipe.expire(self.state_key(user_id, session_id), self._ttl_s)
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        return False
 
     async def get_state(self, user_id: str, session_id: str) -> dict[str, Any]:
         raw = await self._client.get(self.state_key(user_id, session_id))

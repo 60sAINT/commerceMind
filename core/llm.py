@@ -1,6 +1,6 @@
 """最小 LLM 客户端封装。
 
-只负责一件事：把一条用户消息发给 Anthropic 兼容接口，并返回纯文本。
+把单条用户消息或摘要任务发给 Anthropic 兼容接口，并返回纯文本。
 
 - 统一超时：SDK 超时 + `asyncio.timeout` 双保险。
 - 统一错误：把 Anthropic SDK 的异常转换成带 HTTP 状态码的 `LLMError`，
@@ -73,12 +73,21 @@ class LLMClient:
 
     async def chat(self, message: str) -> str:
         """发送一条消息，返回模型生成的纯文本。"""
+        return await self._generate(message, system=SYSTEM_PROMPT)
+
+    async def summarize(self, prompt: str) -> str:
+        """供 MemoryCompactor 注入使用；模型输出被截断时不能提交摘要。"""
+        return await self._generate(
+            prompt, system="你是会话摘要器，只输出忠实、简洁的摘要正文。", reject_truncated=True,
+        )
+
+    async def _generate(self, message: str, *, system: str, reject_truncated: bool = False) -> str:
         try:
             async with asyncio.timeout(self.settings.timeout_s):
                 response = await self._client.messages.create(
                     model=self.settings.model,
                     max_tokens=self.settings.max_tokens,
-                    system=SYSTEM_PROMPT,
+                    system=system,
                     messages=[{"role": "user", "content": message}],
                 )
         except (asyncio.TimeoutError, anthropic.APITimeoutError) as ex:
@@ -130,6 +139,8 @@ class LLMClient:
                 code="llm_api_error",
             ) from ex
 
+        if reject_truncated and getattr(response, "stop_reason", None) == "max_tokens":
+            raise LLMError("摘要输出被截断", code="summary_truncated")
         text = extract_text_content(getattr(response, "content", []))
         if not text:
             raise LLMError(
