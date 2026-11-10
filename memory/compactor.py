@@ -46,8 +46,8 @@ class MemoryCompactor:
         self._tasks: dict[tuple[str, str], asyncio.Task[CompactionResult]] = {}
         self._closed = False
 
-    async def compact(self, user_id: str, session_id: str) -> CompactionResult:
-        """可 await 测试；生产调用 start()。摘要阶段取消不会继续提交裁剪。"""
+    async def compact(self, user_id: str, session_id: str, *, flush_pending: bool = True) -> CompactionResult:
+        """可 await 测试；统一调度使用 maintainer；start() 保留兼容。摘要取消不继续裁剪。"""
         tokens = 0
         try:
             async with asyncio.timeout(self._timeout_s):
@@ -81,7 +81,7 @@ class MemoryCompactor:
                     len(snapshot.turns) - 2 if applied else 0,
                 )
             # Redis 已成功后结束压缩超时区间，向量写入失败/超时只留下待写项。
-            if applied and episode is not None and self._longterm is not None:
+            if flush_pending and applied and episode is not None and self._longterm is not None:
                 try:
                     await asyncio.wait_for(self._longterm.flush_pending(self._store), timeout=15)
                 except Exception as exc:
