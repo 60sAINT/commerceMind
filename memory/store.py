@@ -16,9 +16,10 @@ import redis.asyncio as redis
 from redis.exceptions import WatchError
 
 from memory.locks import KeyedLocks, redis_lease
-from memory.models import MemorySnapshot, Turn
+from memory.models import Episode, MemorySnapshot, Turn
 
 DEFAULT_TTL_S = 7 * 24 * 60 * 60
+PENDING_EPISODES_KEY = "memory:pending_episodes:v1"
 
 
 def _json(value: Any) -> str:
@@ -147,6 +148,7 @@ class RedisMemoryStore:
 
     async def commit_compaction(
         self, user_id: str, session_id: str, *, snapshot: MemorySnapshot, summary: str,
+        episode: Episode | None = None,
     ) -> bool:
         """条件提交摘要，保留快照最近两轮及生成期间新增的所有轮次。
 
@@ -158,6 +160,8 @@ class RedisMemoryStore:
         size = len(snapshot.turns)
         if size <= 2:
             return False
+        # 在裁剪前序列化好脱敏记录；与摘要/裁剪一起提交，向量库失败也不丢 episode。
+        episode_payload = None if episode is None else _json(episode.to_dict())
         key = self.working_key(user_id, session_id)
         skey = self.summary_key(user_id, session_id)
         for _ in range(3):
@@ -173,6 +177,8 @@ class RedisMemoryStore:
                         return False
                     keep_count = len(current) - size + 2
                     pipe.multi()
+                    if episode_payload is not None:
+                        pipe.hset(PENDING_EPISODES_KEY, episode.episode_id, episode_payload)
                     pipe.setex(skey, self._ttl_s, summary)
                     pipe.ltrim(key, 0, keep_count - 1)
                     pipe.expire(key, self._ttl_s)
@@ -182,6 +188,19 @@ class RedisMemoryStore:
                 except WatchError:
                     continue
         return False
+
+    async def get_pending_episodes(self, limit: int = 20) -> list[Episode]:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit 必须为正整数")
+        episodes = []
+        async for _, payload in self._client.hscan_iter(PENDING_EPISODES_KEY):
+            episodes.append(Episode(**json.loads(payload)))
+            if len(episodes) >= limit:
+                break
+        return episodes
+
+    async def ack_episode(self, episode_id: str) -> None:
+        await self._client.hdel(PENDING_EPISODES_KEY, episode_id)
 
     async def get_state(self, user_id: str, session_id: str) -> dict[str, Any]:
         raw = await self._client.get(self.state_key(user_id, session_id))

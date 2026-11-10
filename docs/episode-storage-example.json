@@ -1,0 +1,16 @@
+{
+  "note": "真实 ChromaDB 0.5.23 临时 collection 验收的记录样例；使用 fake:v1 三维 embedding，测试 collection 已删除，不是生产模型的向量。",
+  "ids": ["d32c800dbfcbec5831395a795b2b3b8ec70bdf586275d176a493d354538e98ed"],
+  "documents": ["用户咨询退货，手机号[手机号]，邮箱[邮箱]。"],
+  "metadatas": [{
+    "content_hash": "d1c0c74e39cff5b83be29fdc151ecf531e329f32e93bb0505d7d80305361a2a6",
+    "created_at": "2026-11-10T07:36:19.314796+00:00",
+    "embedding_id": "fake:v1",
+    "session_key": "13c49aa4e416f7a6e0f164f9aa999c65b7fbfb6d4d06329a2602997f8cf10985",
+    "turn_count": 2,
+    "turn_end": "2ccddd243b0b60547a22c9b986a0d5d1f6b602ab8cbc62b517eb6a7bd0d4d6eb",
+    "turn_start": "40fc34bb15d0548a94ac1e5bd8a04864f7b4696bef01a8b15375096e6f39e3ab",
+    "user_key": "cebf292c038fdcd2de5f7ac62c3b81bcfe4efc535383031d762b06b26cfabea2"
+  }],
+  "embeddings": [[1.0, 0.0, 0.0]]
+}

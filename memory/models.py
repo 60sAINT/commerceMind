@@ -83,3 +83,50 @@ class MemorySnapshot:
 
     def to_messages(self) -> list[dict[str, str]]:
         return [message for turn in self.turns for message in turn.to_messages()]
+
+
+def memory_identity(value: str) -> str:
+    """长期库仅保存稳定哈希身份，查询时使用同一转换。"""
+    import hashlib
+    return hashlib.sha256(str(value).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Episode:
+    episode_id: str
+    user_key: str
+    session_key: str
+    turn_start: str
+    turn_end: str
+    turn_count: int
+    summary: str
+    created_at: str
+
+    def __post_init__(self) -> None:
+        if type(self.turn_count) is not int or self.turn_count <= 0:
+            raise ValueError("turn_count 必须为正整数")
+        if not isinstance(self.summary, str) or not self.summary.strip():
+            raise ValueError("episode 摘要不能为空")
+        for name in ("episode_id", "user_key", "session_key", "turn_start", "turn_end"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+                raise ValueError(f"{name} 必须是 SHA-256 标识")
+        datetime.fromisoformat(self.created_at)
+
+    @classmethod
+    def from_turns(cls, user_id: str, session_id: str, turns: tuple[Turn, ...], summary: str) -> Episode:
+        from memory.redaction import redact
+        if not turns:
+            raise ValueError("episode 不能没有轮次")
+        user, session = memory_identity(user_id), memory_identity(session_id)
+        start, end = memory_identity(turns[0].turn_id), memory_identity(turns[-1].turn_id)
+        identity = json.dumps([user, session, [t.turn_id for t in turns]], separators=(",", ":"))
+        return cls(memory_identity(identity), user, session, start, end, len(turns),
+                   redact(summary).strip(), turns[-1].created_at.isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        from dataclasses import asdict
+        from memory.redaction import redact
+        data = asdict(self)
+        data["summary"] = redact(self.summary)
+        return data

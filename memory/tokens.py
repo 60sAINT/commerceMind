@@ -73,6 +73,29 @@ class TokenCounter:
             raise TypeError("text 必须是字符串")
         return len(self._tokenizer.encode(text, add_special_tokens=False).ids)
 
+    def count_text(self, text: str) -> int:
+        """独立文本计数，用于情景记忆输出；不套 working memory 消息模板。"""
+        return self._count_text(text)
+
+    def truncate_text(self, text: str, max_tokens: int, *, prefix: str = "") -> str:
+        """按字符边界缩短副本；计入前文及分隔符，返回前再次验证硬上限。"""
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError("max_tokens 必须为正整数")
+        if self.count_text(prefix + text) <= max_tokens:
+            return text
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self.count_text(prefix + text[:mid]) <= max_tokens:
+                low = mid
+            else:
+                high = mid - 1
+        result = text[:low]
+        # BPE 的前缀计数未必单调；二分只找可用前缀，不保证最长。
+        while result and self.count_text(prefix + result) > max_tokens:
+            result = result[:-1]
+        return result
+
     def count_working_messages(self, messages: Iterable[Mapping[str, Any]]) -> int:
         """输入 working memory 消息列表，输出压缩判断用的 token 数。"""
         normalized = [_normalize(message) for message in messages]
