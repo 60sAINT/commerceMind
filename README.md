@@ -68,6 +68,7 @@ POST /chat
 
 - `session_id` 可省略，服务端生成并在响应中返回；后续轮次带同一个 `session_id` 才能续接记忆。
 - `client_request_id` 可省略；同 ID、同消息直接回放上次结果，同 ID 不同消息返回 409。
+  重试时即使不带 `session_id`，也会按用户级回执回到原会话。
 - Redis/Chroma 不可用时按无记忆模式继续回答，`/health` 显示 `degraded`；
   `COMMERCEMIND_MEMORY_REQUIRED=true` 时启动直接失败。
 
@@ -137,10 +138,43 @@ curl -i -X POST http://127.0.0.1:8000/chat \
 
 服务日志只记录 `request_id`、消息长度、耗时和错误类型，不记录 Key 和用户原文。
 
-### 4. 运行测试
+### 4. 记忆调试接口（仅开发）
+
+`COMMERCEMIND_MEMORY_DEBUG=false`（默认）时路由不存在，访问返回 404。开启后可以只读查看某个会话：
 
 ```bash
-pytest -q tests/test_chat_api.py
+COMMERCEMIND_MEMORY_DEBUG=true uvicorn api.main:app --reload
+
+curl -s "http://127.0.0.1:8000/memory/c1?user_id=u1" | python -m json.tool
+```
+
+```json
+{
+  "session_id": "c1",
+  "user_id": "u1",
+  "turn_count": 2,
+  "summary": "用户正在咨询退款。",
+  "state": {"stage": "refund"},
+  "turns": [
+    {
+      "turn_id": "...",
+      "request_id": "...",
+      "user_message": "订单什么时候发货？",
+      "assistant_message": "请提供订单号。",
+      "created_at": "2026-11-11T09:00:00+00:00",
+      "metadata": {}
+    }
+  ],
+  "ttl_s": {"working": 604700, "state": 604700, "summary": 604700}
+}
+```
+
+该接口只读，不触发压缩、画像或后台维护，也不返回 Redis key 和回执内容。生产环境不要开启。
+
+### 5. 运行测试
+
+```bash
+pytest -q
 ```
 
 测试全部使用 mock，不需要真实 Key，也不会访问模型接口。

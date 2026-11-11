@@ -175,6 +175,22 @@ async def test_receipt_is_written_with_turn_and_readable(store):
 
 
 @pytest.mark.asyncio
+async def test_user_receipt_points_to_original_session(store, redis_client):
+    turn = await store.commit_turn(
+        "user-1", "session-1",
+        request_id="req-1",
+        user_message="同一个请求",
+        assistant_message="只处理一次",
+        client_request_id="client-1",
+    )
+
+    assert await store.get_user_receipt("user-1", "client-1") == ("session-1", turn)
+    assert await store.get_user_receipt("user-2", "client-1") is None
+    key = store.user_receipt_key("user-1")
+    assert 0 < await redis_client.ttl(key) <= 120
+
+
+@pytest.mark.asyncio
 async def test_failed_turn_does_not_write_receipt(store):
     await store.commit_turn(
         "user-1", "session-1",
@@ -186,6 +202,7 @@ async def test_failed_turn_does_not_write_receipt(store):
     )
 
     assert await store.get_receipt("user-1", "session-1", "client-1") is None
+    assert await store.get_user_receipt("user-1", "client-1") is None
 
 
 @pytest.mark.asyncio

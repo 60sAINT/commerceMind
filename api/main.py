@@ -15,10 +15,10 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -71,6 +71,33 @@ class ChatResponse(BaseModel):
     latency_ms: float
     input_tokens: int | None = None
     output_tokens: int | None = None
+
+
+class MemoryTurnDebug(BaseModel):
+    turn_id: str
+    request_id: str
+    user_message: str
+    assistant_message: str
+    created_at: str
+    metadata: dict[str, Any]
+
+
+class MemoryTTLDebug(BaseModel):
+    working: int
+    state: int
+    summary: int
+
+
+class MemoryDebugResponse(BaseModel):
+    """只读调试视图；仅在 COMMERCEMIND_MEMORY_DEBUG=true 时暴露。"""
+
+    session_id: str
+    user_id: str
+    turn_count: int
+    summary: str
+    state: dict[str, Any]
+    turns: list[MemoryTurnDebug]
+    ttl_s: MemoryTTLDebug
 
 
 class _ReceiptConflict(Exception):
@@ -210,17 +237,64 @@ def create_app(
     ) -> ChatResponse | JSONResponse:
         """读记忆、调用模型、提交本轮；失败轮次不写入。"""
         request_id = uuid.uuid4().hex[:12]
-        session_id = req.session_id or uuid.uuid4().hex[:16]
         started = time.perf_counter()
+        memory: ConversationMemory | None = request.app.state.memory
+        session_id = req.session_id or uuid.uuid4().hex[:16]
+        replayed = None
+
+        # 先按 client_request_id 回到原会话：重试不带 session_id 也能回放。
+        if memory is not None and req.client_request_id:
+            try:
+                session_id, replayed = await memory.resolve_session(
+                    req.user_id, req.session_id, req.client_request_id,
+                )
+            except Exception:
+                logger.warning(
+                    "memory_receipt_lookup_failed request_id=%s error_type=%s",
+                    request_id,
+                    "redis",
+                    exc_info=True,
+                )
+                replayed = None
 
         # 只记录长度和标识，不记录用户原文，避免隐私进入日志。
         logger.info(
             "chat_start request_id=%s session_id=%s memory=%s message_chars=%d",
             request_id,
             session_id,
-            request.app.state.memory is not None,
+            memory is not None,
             len(req.message),
         )
+
+        if replayed is not None:
+            if replayed.user_message != req.message:
+                latency_ms = (time.perf_counter() - started) * 1000
+                logger.warning(
+                    "chat_error request_id=%s status=409 "
+                    "error_code=client_request_id_conflict latency_ms=%.1f",
+                    request_id,
+                    latency_ms,
+                )
+                return _error_response(
+                    request_id,
+                    409,
+                    "同一 client_request_id 不能用于不同消息",
+                    error_code="client_request_id_conflict",
+                )
+            latency_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "chat_replay request_id=%s session_id=%s latency_ms=%.1f",
+                replayed.request_id,
+                session_id,
+                latency_ms,
+            )
+            response.headers["X-Request-ID"] = replayed.request_id
+            return ChatResponse(
+                request_id=replayed.request_id,
+                session_id=session_id,
+                response=replayed.assistant_message,
+                latency_ms=round(latency_ms, 1),
+            )
 
         llm: LLMClient | None = request.app.state.llm
         if llm is None:
@@ -237,8 +311,6 @@ def create_app(
                 "模型未配置：请先在 .env 中设置 ANTHROPIC_API_KEY",
                 error_code="model_not_configured",
             )
-
-        memory: ConversationMemory | None = request.app.state.memory
 
         async def run_with_memory() -> ChatResponse:
             async with memory.conversation(req.user_id, session_id):
@@ -434,6 +506,42 @@ def create_app(
         )
         response.headers["X-Request-ID"] = chat_response.request_id
         return chat_response
+
+    # 关闭时不注册路由，避免只在处理函数里判断而暴露接口存在。
+    if settings.memory.debug:
+
+        @app.get(
+            "/memory/{session_id}",
+            response_model=MemoryDebugResponse,
+            tags=["调试"],
+        )
+        async def memory_debug(
+            session_id: str = Path(min_length=1, max_length=128),
+            user_id: str = Query(default="anonymous", min_length=1, max_length=128),
+        ) -> MemoryDebugResponse:
+            """只读查看某会话的 working memory、summary、state 和 TTL。"""
+            memory = app.state.memory
+            session_id = session_id.strip()
+            user_id = user_id.strip() or "anonymous"
+            if memory is None or not session_id:
+                raise HTTPException(status_code=404, detail="Not Found")
+
+            snapshot = await memory.debug_snapshot(user_id, session_id)
+            return MemoryDebugResponse(
+                session_id=snapshot.session_id,
+                user_id=snapshot.user_id,
+                turn_count=len(snapshot.turns),
+                summary=snapshot.summary,
+                state=snapshot.state,
+                turns=[
+                    MemoryTurnDebug(**turn.to_dict()) for turn in snapshot.turns
+                ],
+                ttl_s=MemoryTTLDebug(
+                    working=snapshot.working_ttl_s,
+                    state=snapshot.state_ttl_s,
+                    summary=snapshot.summary_ttl_s,
+                ),
+            )
 
     return app
 

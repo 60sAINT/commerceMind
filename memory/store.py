@@ -65,8 +65,16 @@ class RedisMemoryStore:
         return f"summary_v1:{self.session_key_id(user_id, session_id)}"
 
     def receipt_key(self, user_id: str, session_id: str) -> str:
-        """幂等回执 Hash：client_request_id -> 已提交轮次。"""
+        """会话级幂等回执 Hash：client_request_id -> 已提交轮次。"""
         return f"receipt_v1:{self.session_key_id(user_id, session_id)}"
+
+    @staticmethod
+    def user_key_id(user_id: str) -> str:
+        """用户级回执索引；只用于按 client_request_id 找到原会话。"""
+        return hashlib.sha256(str(user_id).encode()).hexdigest()
+
+    def user_receipt_key(self, user_id: str) -> str:
+        return f"ureceipt_v1:{self.user_key_id(user_id)}"
 
     @asynccontextmanager
     async def _session_lock(self, user_id: str, session_id: str) -> AsyncIterator[None]:
@@ -152,6 +160,13 @@ class RedisMemoryStore:
                     receipt_key = self.receipt_key(user_id, session_id)
                     pipe.hset(receipt_key, client_request_id, payload)
                     pipe.expire(receipt_key, self._ttl_s)
+                    # 用户级索引：重试未带 session_id 时也能回到原会话。
+                    pipe.hset(
+                        self.user_receipt_key(user_id),
+                        client_request_id,
+                        _json({"session_id": session_id, "turn": turn.to_dict()}),
+                    )
+                    pipe.expire(self.user_receipt_key(user_id), self._ttl_s)
                 await pipe.execute()
         return turn
 
@@ -163,6 +178,27 @@ class RedisMemoryStore:
             raise ValueError("client_request_id 必须是非空字符串")
         raw = await self._client.hget(self.receipt_key(user_id, session_id), client_request_id)
         return Turn.from_json(raw) if raw else None
+
+    async def get_user_receipt(
+        self, user_id: str, client_request_id: str,
+    ) -> tuple[str, Turn] | None:
+        """按 client_request_id 找到原会话和轮次；用于无 session_id 的重试。"""
+        if not isinstance(client_request_id, str) or not client_request_id.strip():
+            raise ValueError("client_request_id 必须是非空字符串")
+        raw = await self._client.hget(self.user_receipt_key(user_id), client_request_id)
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return str(data["session_id"]), Turn.from_dict(data["turn"])
+
+    async def get_ttls(self, user_id: str, session_id: str) -> tuple[int, int, int]:
+        """返回 working / state / summary 的 TTL；不存在为 -2，无过期时间为 -1。"""
+        async with self._client.pipeline(transaction=False) as pipe:
+            pipe.ttl(self.working_key(user_id, session_id))
+            pipe.ttl(self.state_key(user_id, session_id))
+            pipe.ttl(self.summary_key(user_id, session_id))
+            working, state, summary = await pipe.execute()
+        return int(working), int(state), int(summary)
 
     async def get_turns(
         self,

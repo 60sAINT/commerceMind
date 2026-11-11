@@ -63,6 +63,7 @@ class MemorySettings:
     ttl_s: int = DEFAULT_MEMORY_TTL_S
     chroma_host: str = "localhost"
     chroma_port: int = 8001
+    debug: bool = False
 
     def __post_init__(self) -> None:
         if self.required and not self.enabled:
@@ -128,5 +129,6 @@ class Settings:
                 ttl_s=_env_int("COMMERCEMIND_MEMORY_TTL_SECONDS", DEFAULT_MEMORY_TTL_S),
                 chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                 chroma_port=_env_int("CHROMA_PORT", 8001),
+                debug=_env_bool("COMMERCEMIND_MEMORY_DEBUG", False),
             ),
         )

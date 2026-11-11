@@ -9,6 +9,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from core.config import MemorySettings
 from memory.compactor import MemoryCompactor
@@ -21,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 _HEALTH_TIMEOUT_S = 1.5
 _STARTUP_TIMEOUT_S = 3.0
+
+
+@dataclass(frozen=True, slots=True)
+class DebugSnapshot:
+    """只读会话调试快照；不触发压缩或后台维护。"""
+
+    session_id: str
+    user_id: str
+    turns: tuple[Turn, ...]
+    state: dict[str, Any]
+    summary: str
+    working_ttl_s: int
+    state_ttl_s: int
+    summary_ttl_s: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,8 +121,37 @@ class ConversationMemory:
             return None
         return await self.store.get_receipt(user_id, session_id, client_request_id)
 
+    async def resolve_session(
+        self,
+        user_id: str,
+        requested_session_id: str | None,
+        client_request_id: str | None,
+    ) -> tuple[str, Turn | None]:
+        """优先按 client_request_id 回到原会话，避免重试因缺 session_id 另起一轮。"""
+        if client_request_id:
+            found = await self.store.get_user_receipt(user_id, client_request_id)
+            if found is not None:
+                return found
+        return requested_session_id or uuid4().hex[:16], None
+
     async def read_context(self, user_id: str, session_id: str) -> MemoryContext:
         return await self._context.get_context(user_id, session_id)
+
+    async def debug_snapshot(self, user_id: str, session_id: str) -> DebugSnapshot:
+        snapshot = await self.store.get_snapshot(user_id, session_id)
+        working_ttl, state_ttl, summary_ttl = await self.store.get_ttls(
+            user_id, session_id,
+        )
+        return DebugSnapshot(
+            session_id=session_id,
+            user_id=user_id,
+            turns=snapshot.turns,
+            state=dict(snapshot.state),
+            summary=snapshot.summary,
+            working_ttl_s=working_ttl,
+            state_ttl_s=state_ttl,
+            summary_ttl_s=summary_ttl,
+        )
 
     async def commit(
         self,

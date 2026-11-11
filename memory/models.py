@@ -36,19 +36,21 @@ class Turn:
         if not isinstance(self.metadata, dict):
             raise TypeError("metadata 必须是字典")
 
-    def to_json(self) -> str:
-        return json.dumps({
+    def to_dict(self) -> dict[str, Any]:
+        return {
             "turn_id": self.turn_id,
             "request_id": self.request_id,
             "user_message": self.user_message,
             "assistant_message": self.assistant_message,
             "created_at": self.created_at.isoformat(),
             "metadata": self.metadata,
-        }, ensure_ascii=False, separators=(",", ":"))
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, raw: str) -> Turn:
-        data = json.loads(raw)
+    def from_dict(cls, data: dict[str, Any]) -> Turn:
         return cls(
             turn_id=data["turn_id"],
             request_id=data["request_id"],
@@ -57,6 +59,10 @@ class Turn:
             created_at=datetime.fromisoformat(data["created_at"]),
             metadata=data.get("metadata") or {},
         )
+
+    @classmethod
+    def from_json(cls, raw: str) -> Turn:
+        return cls.from_dict(json.loads(raw))
 
     def to_messages(self) -> list[dict[str, str]]:
         return [

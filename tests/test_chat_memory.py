@@ -34,9 +34,11 @@ class FakeLLM:
         return ChatResult(self.text, input_tokens=10, output_tokens=5)
 
 
-def make_settings(*, memory_enabled: bool = True) -> Settings:
+def make_settings(
+    *, memory_enabled: bool = True, debug: bool = False, api_key: str = "test-key",
+) -> Settings:
     return Settings(
-        api_key="test-key",
+        api_key=api_key,
         model=MODEL,
         timeout_s=2,
         max_tokens=64,
@@ -46,6 +48,7 @@ def make_settings(*, memory_enabled: bool = True) -> Settings:
             redis_url="redis://localhost:1/0",
             ttl_s=120,
             chroma_port=8001,
+            debug=debug,
         ),
     )
 
@@ -201,6 +204,73 @@ async def test_same_client_request_id_with_different_message_conflicts(memory_en
 
 
 @pytest.mark.asyncio
+async def test_retry_without_session_id_uses_original_session(memory_env):
+    store, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM("原会话回答")
+    app.state.llm = llm
+
+    first = await send(
+        app, "POST", "/chat",
+        json=chat_body("重复请求", session_id=None, request_id="same"),
+    )
+    second = await send(
+        app, "POST", "/chat",
+        json=chat_body("重复请求", session_id=None, request_id="same"),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["session_id"] == second.json()["session_id"]
+    assert first.json()["request_id"] == second.json()["request_id"]
+    assert len(llm.calls) == 1
+    assert len(await store.get_turns("u1", first.json()["session_id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_conflict_without_session_id_returns_409(memory_env):
+    _, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM()
+    app.state.llm = llm
+
+    await send(
+        app, "POST", "/chat",
+        json=chat_body("第一句", session_id=None, request_id="same"),
+    )
+    response = await send(
+        app, "POST", "/chat",
+        json=chat_body("第二句", session_id=None, request_id="same"),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "client_request_id_conflict"
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_works_even_when_model_is_not_configured(memory_env):
+    _, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    app.state.llm = FakeLLM("缓存回答")
+
+    first = await send(
+        app, "POST", "/chat",
+        json=chat_body("重复请求", request_id="same"),
+    )
+    assert first.status_code == 200
+
+    app.state.llm = None
+    second = await send(
+        app, "POST", "/chat",
+        json=chat_body("重复请求", request_id="same"),
+    )
+
+    assert second.status_code == 200
+    assert second.json()["response"] == "缓存回答"
+
+
+@pytest.mark.asyncio
 async def test_summary_is_injected_into_system_not_messages(memory_env):
     store, service = memory_env
     await store.set_summary("u1", "c1", "用户叫小李，正在咨询退款。")
@@ -302,6 +372,97 @@ async def test_health_degrades_when_memory_enabled_but_not_started():
     assert body["memory"]["redis"] == "error"
 
 
+@pytest.mark.asyncio
+async def test_memory_debug_route_is_hidden_when_disabled(memory_env):
+    _, service = memory_env
+    app = create_app(make_settings(debug=False), memory=service)
+
+    response = await send(app, "GET", "/memory/c1", params={"user_id": "u1"})
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_memory_debug_route_is_hidden_when_memory_not_started():
+    app = create_app(make_settings(debug=True))
+
+    response = await send(app, "GET", "/memory/c1", params={"user_id": "u1"})
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_memory_debug_returns_snapshot(memory_env):
+    store, service = memory_env
+    await store.commit_turn(
+        "u1", "c1",
+        request_id="r1",
+        user_message="第一问",
+        assistant_message="第一答",
+    )
+    await store.commit_turn(
+        "u1", "c1",
+        request_id="r2",
+        user_message="第二问",
+        assistant_message="第二答",
+        state={"stage": "refund"},
+        summary="用户正在咨询退款。",
+    )
+    app = create_app(make_settings(debug=True), memory=service)
+
+    response = await send(app, "GET", "/memory/c1", params={"user_id": "u1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == "c1"
+    assert body["user_id"] == "u1"
+    assert body["turn_count"] == 2
+    assert [turn["user_message"] for turn in body["turns"]] == ["第一问", "第二问"]
+    assert body["turns"][0]["request_id"] == "r1"
+    assert body["turns"][0]["created_at"]
+    assert body["state"] == {"stage": "refund"}
+    assert body["summary"] == "用户正在咨询退款。"
+    assert 0 < body["ttl_s"]["working"] <= 120
+    assert 0 < body["ttl_s"]["state"] <= 120
+    assert 0 < body["ttl_s"]["summary"] <= 120
+    # 不暴露内部 key 与回执内容。
+    assert "receipt" not in response.text
+    assert "wm_v1" not in response.text
+    assert "ureceipt_v1" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_memory_debug_is_isolated_by_user_and_missing_session(memory_env):
+    store, service = memory_env
+    await store.commit_turn(
+        "u1", "c1",
+        request_id="r1",
+        user_message="第一问",
+        assistant_message="第一答",
+    )
+    app = create_app(make_settings(debug=True), memory=service)
+
+    other_user = await send(app, "GET", "/memory/c1", params={"user_id": "u2"})
+    missing = await send(app, "GET", "/memory/missing", params={"user_id": "u1"})
+
+    assert other_user.status_code == 200
+    assert other_user.json()["turn_count"] == 0
+    assert missing.status_code == 200
+    assert missing.json()["turn_count"] == 0
+    assert missing.json()["ttl_s"]["working"] == -2
+
+
+@pytest.mark.asyncio
+async def test_memory_debug_works_without_model_key(memory_env):
+    _, service = memory_env
+    app = create_app(make_settings(debug=True, api_key=""), memory=service)
+
+    response = await send(app, "GET", "/memory/c1", params={"user_id": "u1"})
+
+    assert response.status_code == 200
+    assert response.json()["turn_count"] == 0
+
+
 def test_memory_settings_validate_required_and_ttl():
     with pytest.raises(ValueError):
         MemorySettings(enabled=False, required=True)
@@ -318,6 +479,7 @@ def test_settings_from_env_reads_memory_config(monkeypatch):
     monkeypatch.setenv("COMMERCEMIND_MEMORY_TTL_SECONDS", "120")
     monkeypatch.setenv("CHROMA_HOST", "chroma")
     monkeypatch.setenv("CHROMA_PORT", "8000")
+    monkeypatch.setenv("COMMERCEMIND_MEMORY_DEBUG", "true")
 
     settings = Settings.from_env()
 
@@ -327,6 +489,7 @@ def test_settings_from_env_reads_memory_config(monkeypatch):
     assert settings.memory.ttl_s == 120
     assert settings.memory.chroma_host == "chroma"
     assert settings.memory.chroma_port == 8000
+    assert settings.memory.debug is True
 
 
 @pytest.mark.asyncio
