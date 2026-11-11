@@ -79,6 +79,36 @@ class MemorySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class IntentSettings:
+    """三路意图识别参数；关闭时不影响现有聊天路径。"""
+
+    enabled: bool = False
+    llm_enabled: bool = True
+    embedding_enabled: bool = True
+    pattern_enabled: bool = True
+    llm_weight: float = 0.70
+    embedding_weight: float = 0.20
+    pattern_weight: float = 0.10
+    confidence_threshold: float = 0.35
+    embedding_threshold: float = 0.72
+    failure_policy: str = "available_sources"
+
+    def __post_init__(self) -> None:
+        for name in ("llm_weight", "embedding_weight", "pattern_weight"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{name} 必须是非负数")
+        if sum((self.llm_weight, self.embedding_weight, self.pattern_weight)) <= 0:
+            raise ValueError("至少一个意图来源权重必须大于 0")
+        for name in ("confidence_threshold", "embedding_threshold"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                raise ValueError(f"{name} 必须在 0 到 1 之间")
+        if self.failure_policy not in {"available_sources", "other"}:
+            raise ValueError("failure_policy 仅支持 available_sources 或 other")
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """运行期配置。
 
@@ -96,6 +126,7 @@ class Settings:
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_tokens: int = DEFAULT_MAX_TOKENS
     memory: MemorySettings = field(default_factory=MemorySettings)
+    intent: IntentSettings = field(default_factory=IntentSettings)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "api_key", self.api_key.strip())
@@ -130,5 +161,17 @@ class Settings:
                 chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                 chroma_port=_env_int("CHROMA_PORT", 8001),
                 debug=_env_bool("COMMERCEMIND_MEMORY_DEBUG", False),
+            ),
+            intent=IntentSettings(
+                enabled=_env_bool("COMMERCEMIND_INTENT_ENABLED", False),
+                llm_enabled=_env_bool("COMMERCEMIND_INTENT_LLM_ENABLED", True),
+                embedding_enabled=_env_bool("COMMERCEMIND_INTENT_EMBEDDING_ENABLED", True),
+                pattern_enabled=_env_bool("COMMERCEMIND_INTENT_PATTERN_ENABLED", True),
+                llm_weight=_env_float("COMMERCEMIND_INTENT_LLM_WEIGHT", 0.70),
+                embedding_weight=_env_float("COMMERCEMIND_INTENT_EMBEDDING_WEIGHT", 0.20),
+                pattern_weight=_env_float("COMMERCEMIND_INTENT_PATTERN_WEIGHT", 0.10),
+                confidence_threshold=_env_float("COMMERCEMIND_INTENT_CONFIDENCE_THRESHOLD", 0.35),
+                embedding_threshold=_env_float("COMMERCEMIND_INTENT_EMBEDDING_THRESHOLD", 0.72),
+                failure_policy=os.getenv("COMMERCEMIND_INTENT_FAILURE_POLICY", "available_sources").strip(),
             ),
         )

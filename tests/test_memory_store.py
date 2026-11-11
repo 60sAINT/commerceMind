@@ -136,6 +136,51 @@ async def test_state_and_summary_are_committed_with_turn(store):
 
 
 @pytest.mark.asyncio
+async def test_state_round_trip_and_missing_state_default(store):
+    assert await store.get_state("user-1", "session-1") == {}
+
+    await store.set_state("user-1", "session-1", {
+        "intent": {"name": "refund", "confidence": 0.91},
+        "slots": {"order_id": "A-123"},
+    })
+
+    assert await store.get_state("user-1", "session-1") == {
+        "intent": {"name": "refund", "confidence": 0.91},
+        "slots": {"order_id": "A-123"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_state_is_isolated_between_sessions(store):
+    await store.set_state("user-1", "session-1", {"intent": "refund"})
+    await store.set_state("user-1", "session-2", {"intent": "shipping"})
+
+    assert await store.get_state("user-1", "session-1") == {"intent": "refund"}
+    assert await store.get_state("user-1", "session-2") == {"intent": "shipping"}
+
+
+@pytest.mark.asyncio
+async def test_state_ttl_is_set_and_refreshed_by_direct_write(store, redis_client):
+    key = store.state_key("user-1", "session-1")
+    await store.set_state("user-1", "session-1", {"stage": "first"})
+    assert 0 < await redis_client.ttl(key) <= 120
+
+    await redis_client.expire(key, 5)
+    await store.set_state("user-1", "session-1", {"stage": "second"})
+    assert await redis_client.ttl(key) > 5
+
+
+@pytest.mark.asyncio
+async def test_expired_state_reads_as_empty(store, redis_client):
+    key = store.state_key("user-1", "session-1")
+    await store.set_state("user-1", "session-1", {"intent": "refund"})
+    await redis_client.delete(key)
+
+    assert await store.get_state("user-1", "session-1") == {}
+    assert (await store.get_snapshot("user-1", "session-1")).state == {}
+
+
+@pytest.mark.asyncio
 async def test_serialization_error_writes_nothing(store, redis_client):
     with pytest.raises(TypeError):
         await add_turn(store, 0, state={"bad": object()})
