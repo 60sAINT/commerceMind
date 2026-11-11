@@ -17,6 +17,7 @@ from memory.context import ContextBuilder, MemoryContext
 from memory.maintainer import MemoryMaintainer
 from memory.models import Turn
 from memory.store import RedisMemoryStore
+from core.intent import IntentResult
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,17 @@ class ConversationMemory:
 
     async def read_context(self, user_id: str, session_id: str) -> MemoryContext:
         return await self._context.get_context(user_id, session_id)
+
+    async def persist_intent(
+        self, user_id: str, session_id: str, result: IntentResult,
+    ) -> None:
+        """在会话 state 中写入最新意图结果，同时保留其他 state 字段。"""
+        if not isinstance(result, IntentResult):
+            raise TypeError("result 必须是 IntentResult")
+        async with self.store.conversation(user_id, session_id):
+            state = await self.store.get_state(user_id, session_id)
+            state["intent"] = result.to_state()
+            await self.store.set_state(user_id, session_id, state)
 
     async def debug_snapshot(self, user_id: str, session_id: str) -> DebugSnapshot:
         snapshot = await self.store.get_snapshot(user_id, session_id)
