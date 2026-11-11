@@ -23,6 +23,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from core.config import Settings
+from core.intent import IntentSource
+from core.intent_embedding import IntentEmbeddingMatcher
+from core.intent_fusion import combine_intents
+from core.intent_llm import IntentLLMClassifier
+from core.intent_pattern import recognize_pattern
 from core.llm import SYSTEM_PROMPT, ChatResult, LLMClient, LLMError
 from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
@@ -132,6 +137,29 @@ def _result_usage(result: ChatResult | str) -> tuple[int | None, int | None]:
     if isinstance(result, ChatResult):
         return result.input_tokens, result.output_tokens
     return None, None
+
+
+async def _recognize_intent(message: str, llm: LLMClient, settings, *, history=None):
+    """并行执行启用的单路识别，再融合为统一结果。"""
+    candidates = {}
+    tasks = []
+    sources = []
+    if settings.llm_enabled:
+        tasks.append(IntentLLMClassifier(llm).recognize(message, history=history))
+        sources.append(IntentSource.LLM)
+    if settings.embedding_enabled:
+        matcher = IntentEmbeddingMatcher.from_env(settings)
+        tasks.append(asyncio.to_thread(matcher.recognize, message))
+        sources.append(IntentSource.EMBEDDING)
+    if settings.pattern_enabled:
+        tasks.append(asyncio.to_thread(recognize_pattern, message))
+        sources.append(IntentSource.PATTERN)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for source, result in zip(sources, results):
+        if isinstance(result, BaseException):
+            continue
+        candidates[source] = result.candidate if source is IntentSource.PATTERN else result
+    return combine_intents(candidates, settings)
 
 
 def create_app(
@@ -347,6 +375,30 @@ def create_app(
                     context = None
 
                 if context is None:
+                    try:
+                        state = await memory.store.get_state(req.user_id, session_id)
+                    except Exception:
+                        state = None
+                    history = None
+                else:
+                    state = dict(context.state)
+                    history = list(context.recent_messages[-5:]) or None
+
+                intent_settings = request.app.state.settings.intent
+                if intent_settings.enabled:
+                    try:
+                        intent_result = await _recognize_intent(
+                            req.message, llm, intent_settings, history=history,
+                        )
+                        if state is not None:
+                            state["intent"] = intent_result.to_state()
+                    except Exception:
+                        logger.warning(
+                            "intent_recognition_failed request_id=%s session_id=%s",
+                            request_id, session_id, exc_info=True,
+                        )
+
+                if context is None:
                     result = await llm.chat(req.message)
                 else:
                     result = await llm.chat(
@@ -367,6 +419,7 @@ def create_app(
                         answer=text,
                         client_request_id=req.client_request_id,
                         lock_held=True,
+                        state=state if intent_settings.enabled and state is not None else None,
                     )
                 except Exception:
                     # 答案已经生成，写入失败只降级记忆，不把本轮回答丢掉。

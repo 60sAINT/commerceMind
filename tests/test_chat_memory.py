@@ -10,7 +10,8 @@ import pytest_asyncio
 from fakeredis.aioredis import FakeRedis
 
 from api.main import create_app
-from core.config import MemorySettings, Settings
+from core.config import IntentSettings, MemorySettings, Settings
+from core.intent import IntentCategory, IntentResult, IntentSource
 from core.llm import ChatResult, LLMError
 from memory.locks import LockBusyError
 from memory.service import ConversationMemory
@@ -36,6 +37,7 @@ class FakeLLM:
 
 def make_settings(
     *, memory_enabled: bool = True, debug: bool = False, api_key: str = "test-key",
+    intent: IntentSettings | None = None,
 ) -> Settings:
     return Settings(
         api_key=api_key,
@@ -50,6 +52,7 @@ def make_settings(
             chroma_port=8001,
             debug=debug,
         ),
+        intent=intent or IntentSettings(),
     )
 
 
@@ -112,6 +115,50 @@ async def test_second_turn_reads_first_turn(memory_env):
     turns = await store.get_turns("u1", "c1")
     assert [turn.user_message for turn in turns] == ["我叫小李", "我叫什么？"]
     assert second.json()["input_tokens"] == 10
+
+
+@pytest.mark.asyncio
+async def test_chat_persists_intent_atomically_with_successful_turn(memory_env, monkeypatch):
+    store, service = memory_env
+    settings = make_settings(intent=IntentSettings(enabled=True))
+    app = create_app(settings, memory=service)
+    app.state.llm = FakeLLM("退款会在 3-5 个工作日到账。")
+
+    async def recognize(message, llm, intent_settings, *, history=None):
+        assert message == "我的订单什么时候退款？"
+        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
+
+    monkeypatch.setattr("api.main._recognize_intent", recognize)
+    response = await send(app, "POST", "/chat", json=chat_body("我的订单什么时候退款？"))
+
+    assert response.status_code == 200
+    snapshot = await store.get_snapshot("u1", "c1")
+    assert len(snapshot.turns) == 1
+    assert snapshot.state["intent"]["intent"] == "refund"
+    assert snapshot.state["intent"]["confidence"] == 0.91
+    assert "intent" not in response.json()
+
+
+@pytest.mark.asyncio
+async def test_failed_chat_may_recognize_but_does_not_persist_intent(memory_env, monkeypatch):
+    store, service = memory_env
+    settings = make_settings(intent=IntentSettings(enabled=True))
+    app = create_app(settings, memory=service)
+    app.state.llm = FakeLLM(error=LLMError("offline"))
+
+    calls = []
+
+    async def recognize(*args, **kwargs):
+        calls.append((args, kwargs))
+        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
+
+    monkeypatch.setattr("api.main._recognize_intent", recognize)
+    response = await send(app, "POST", "/chat", json=chat_body("我要退款"))
+
+    assert response.status_code == 503
+    assert len(calls) == 1
+    assert await store.get_state("u1", "c1") == {}
+    assert await store.get_turns("u1", "c1") == []
 
 
 @pytest.mark.asyncio

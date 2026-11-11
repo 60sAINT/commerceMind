@@ -22,13 +22,13 @@ class IntentLLMClassifier:
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
 
-    async def recognize(self, message: str) -> IntentCandidate:
+    async def recognize(self, message: str, *, history=None) -> IntentCandidate:
         if not isinstance(message, str):
             raise TypeError("message 必须是字符串")
         if not message.strip():
             return IntentCandidate(IntentCategory.OTHER, 0.0, IntentSource.LLM)
         try:
-            response = await self._llm.chat(message, system=_SYSTEM_PROMPT)
+            response = await self._llm.chat(message, history=history, system=_SYSTEM_PROMPT)
             data = self._parse(response.text)
             return IntentCandidate(
                 IntentCategory(data["intent"]), data["confidence"], IntentSource.LLM,
