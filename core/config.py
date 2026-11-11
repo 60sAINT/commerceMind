@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_TOKENS = 1024
+DEFAULT_MEMORY_TTL_S = 7 * 24 * 60 * 60
 _PLACEHOLDER_KEYS = frozenset({"xxx", "your-key", "your_api_key", "replace-me", "changeme"})
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 def _env_float(name: str, default: float) -> float:
@@ -39,6 +41,42 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔配置；无法识别时回退默认值。"""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in _TRUE_VALUES
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySettings:
+    """短期记忆（Redis）配置。
+
+    默认关闭，避免库调用方在未显式配置时连接真实 Redis；应用进程通过
+    `Settings.from_env()` 读取 `.env`，生产环境通常为开启状态。
+    """
+
+    enabled: bool = False
+    required: bool = False
+    redis_url: str = "redis://localhost:6379/0"
+    ttl_s: int = DEFAULT_MEMORY_TTL_S
+    chroma_host: str = "localhost"
+    chroma_port: int = 8001
+
+    def __post_init__(self) -> None:
+        if self.required and not self.enabled:
+            raise ValueError("记忆 required 为 true 时必须同时 enabled")
+        object.__setattr__(self, "redis_url", (self.redis_url or "").strip())
+        object.__setattr__(self, "chroma_host", (self.chroma_host or "").strip())
+        if self.enabled and not self.redis_url:
+            raise ValueError("COMMERCEMIND_MEMORY_ENABLED=true 时 REDIS_URL 不能为空")
+        if type(self.ttl_s) is not int or self.ttl_s <= 0:
+            raise ValueError("COMMERCEMIND_MEMORY_TTL_SECONDS 必须是正整数")
+        if type(self.chroma_port) is not int or not 0 < self.chroma_port < 65536:
+            raise ValueError("CHROMA_PORT 必须是合法端口")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """运行期配置。
@@ -56,6 +94,7 @@ class Settings:
     model: str = DEFAULT_MODEL
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_tokens: int = DEFAULT_MAX_TOKENS
+    memory: MemorySettings = field(default_factory=MemorySettings)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "api_key", self.api_key.strip())
@@ -82,4 +121,12 @@ class Settings:
             model=os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL),
             timeout_s=_env_float("COMMERCEMIND_LLM_TIMEOUT_S", DEFAULT_TIMEOUT_S),
             max_tokens=_env_int("COMMERCEMIND_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+            memory=MemorySettings(
+                enabled=_env_bool("COMMERCEMIND_MEMORY_ENABLED", False),
+                required=_env_bool("COMMERCEMIND_MEMORY_REQUIRED", False),
+                redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                ttl_s=_env_int("COMMERCEMIND_MEMORY_TTL_SECONDS", DEFAULT_MEMORY_TTL_S),
+                chroma_host=os.getenv("CHROMA_HOST", "localhost"),
+                chroma_port=_env_int("CHROMA_PORT", 8001),
+            ),
         )

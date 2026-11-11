@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 import anthropic
@@ -31,6 +33,52 @@ class LLMError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class ChatResult:
+    """一次模型调用的文本和 usage；上游不返回 usage 时为 None。"""
+
+    text: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def _build_messages(
+    message: str,
+    history: Sequence[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    """把历史消息和当前问题拼成 Anthropic messages；system 不放在这里。"""
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message 不能为空")
+
+    messages: list[dict[str, str]] = []
+    for item in history or ():
+        if not isinstance(item, dict):
+            raise ValueError("history 的每一项必须是字典")
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant"):
+            raise ValueError("history 只支持 user / assistant 角色")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("history 的 content 不能为空")
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _usage_tokens(usage: Any) -> tuple[int | None, int | None]:
+    if usage is None:
+        return None, None
+    if isinstance(usage, dict):
+        input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
+    else:
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+    return (
+        input_tokens if isinstance(input_tokens, int) else None,
+        output_tokens if isinstance(output_tokens, int) else None,
+    )
 
 
 def extract_text_content(content: Iterable[Any], separator: str = "\n") -> str:
@@ -71,29 +119,49 @@ class LLMClient:
         self.settings = settings
         self._client = AsyncAnthropic(**kwargs)
 
-    async def chat(self, message: str) -> str:
-        """发送一条消息，返回模型生成的纯文本。"""
-        return await self._generate(message, system=SYSTEM_PROMPT)
+    async def chat(
+        self,
+        message: str,
+        *,
+        history: Sequence[dict[str, Any]] | None = None,
+        system: str | None = None,
+    ) -> ChatResult:
+        """发送当前问题及可选历史，返回文本和 usage。"""
+        messages = _build_messages(message, history)
+        return await self._generate(messages, system=system or SYSTEM_PROMPT)
 
     async def summarize(self, prompt: str) -> str:
         """供 MemoryCompactor 注入使用；模型输出被截断时不能提交摘要。"""
-        return await self._generate(
-            prompt, system="你是会话摘要器，只输出忠实、简洁的摘要正文。", reject_truncated=True,
+        result = await self._generate(
+            [{"role": "user", "content": prompt}],
+            system="你是会话摘要器，只输出忠实、简洁的摘要正文。",
+            reject_truncated=True,
         )
+        return result.text
 
     async def extract_profile(self, prompt: str) -> str:
         """用户画像抽取；独立 JSON 指令，截断输出视为失败。"""
-        return await self._generate(prompt, system="你是用户画像提取器，只输出符合要求的 JSON 对象。",
-                                    reject_truncated=True)
+        result = await self._generate(
+            [{"role": "user", "content": prompt}],
+            system="你是用户画像提取器，只输出符合要求的 JSON 对象。",
+            reject_truncated=True,
+        )
+        return result.text
 
-    async def _generate(self, message: str, *, system: str, reject_truncated: bool = False) -> str:
+    async def _generate(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        system: str,
+        reject_truncated: bool = False,
+    ) -> ChatResult:
         try:
             async with asyncio.timeout(self.settings.timeout_s):
                 response = await self._client.messages.create(
                     model=self.settings.model,
                     max_tokens=self.settings.max_tokens,
                     system=system,
-                    messages=[{"role": "user", "content": message}],
+                    messages=messages,
                 )
         except (asyncio.TimeoutError, anthropic.APITimeoutError) as ex:
             raise LLMError(
@@ -153,4 +221,5 @@ class LLMClient:
                 status_code=502,
                 code="llm_empty_response",
             )
-        return text
+        input_tokens, output_tokens = _usage_tokens(getattr(response, "usage", None))
+        return ChatResult(text=text, input_tokens=input_tokens, output_tokens=output_tokens)

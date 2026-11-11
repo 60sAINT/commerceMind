@@ -1,6 +1,6 @@
 # 后台记忆维护队列
 
-`memory/maintainer.py` 提供 `MemoryMaintainer` 工具类。它是调度员，不负责生成摘要内容、拼上下文或提交聊天本身；复用 `MemoryCompactor`、Redis 条件提交和长期记忆待办能力。目前未接入 `/chat`，下列代码是应用层接入方式。
+`memory/maintainer.py` 提供 `MemoryMaintainer` 工具类。它是调度员，不负责生成摘要内容、拼上下文或提交聊天本身；复用 `MemoryCompactor`、Redis 条件提交和长期记忆待办能力。`/chat` 已通过 `memory/service.py` 的 `ConversationMemory` 在成功轮次后调用 `submit()`；下列代码是等价的直接接入方式。
 
 ## 谁调用，什么时候调用
 

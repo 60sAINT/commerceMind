@@ -9,7 +9,7 @@ import pytest
 
 from api.main import create_app
 from core.config import Settings
-from core.llm import LLMClient, LLMError, extract_text_content
+from core.llm import ChatResult, LLMClient, LLMError, extract_text_content
 
 MODEL = "test-model"
 
@@ -17,16 +17,26 @@ MODEL = "test-model"
 class FakeLLM:
     """替身 LLM：用于验证 FastAPI 层的行为，不访问网络。"""
 
-    def __init__(self, text: str = "退款一般 3-5 个工作日到账。", error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        text: str = "退款一般 3-5 个工作日到账。",
+        error: Exception | None = None,
+    ) -> None:
         self.text = text
         self.error = error
         self.last_message: str | None = None
+        self.last_history: list[dict[str, str]] = []
+        self.last_system: str | None = None
+        self.calls = 0
 
-    async def chat(self, message: str) -> str:
+    async def chat(self, message: str, *, history=None, system=None) -> ChatResult:
         self.last_message = message
+        self.last_history = list(history or [])
+        self.last_system = system
+        self.calls += 1
         if self.error is not None:
             raise self.error
-        return self.text
+        return ChatResult(self.text)
 
 
 def make_app(*, api_key: str = "test-key") -> object:

@@ -158,3 +158,46 @@ async def test_redis_lease_serializes_concurrent_sections(redis_client):
         ["a:start", "a:end", "b:start", "b:end"],
         ["b:start", "b:end", "a:start", "a:end"],
     )
+
+
+@pytest.mark.asyncio
+async def test_receipt_is_written_with_turn_and_readable(store):
+    turn = await store.commit_turn(
+        "user-1", "session-1",
+        request_id="req-1",
+        user_message="同一个请求",
+        assistant_message="只处理一次",
+        client_request_id="client-1",
+    )
+
+    assert await store.get_receipt("user-1", "session-1", "client-1") == turn
+    assert await store.get_receipt("user-1", "session-1", "other") is None
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_does_not_write_receipt(store):
+    await store.commit_turn(
+        "user-1", "session-1",
+        request_id="req-1",
+        user_message="失败",
+        assistant_message="不保存",
+        succeeded=False,
+        client_request_id="client-1",
+    )
+
+    assert await store.get_receipt("user-1", "session-1", "client-1") is None
+
+
+@pytest.mark.asyncio
+async def test_commit_inside_held_conversation_lock_does_not_deadlock(store):
+    async with store.conversation("user-1", "session-1"):
+        turn = await store.commit_turn(
+            "user-1", "session-1",
+            request_id="req-1",
+            user_message="持锁提交",
+            assistant_message="成功",
+            lock_held=True,
+        )
+
+    assert turn is not None
+    assert len(await store.get_turns("user-1", "session-1")) == 1

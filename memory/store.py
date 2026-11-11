@@ -40,7 +40,14 @@ class RedisMemoryStore:
 
     @classmethod
     def from_url(cls, url: str, *, ttl_s: int = DEFAULT_TTL_S) -> RedisMemoryStore:
-        return cls(redis.from_url(url, decode_responses=True), ttl_s=ttl_s)
+        # 短超时避免记忆依赖不可用时拖住启动和健康检查。
+        client = redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=5,
+        )
+        return cls(client, ttl_s=ttl_s)
 
     @staticmethod
     def session_key_id(user_id: str, session_id: str) -> str:
@@ -57,12 +64,32 @@ class RedisMemoryStore:
     def summary_key(self, user_id: str, session_id: str) -> str:
         return f"summary_v1:{self.session_key_id(user_id, session_id)}"
 
+    def receipt_key(self, user_id: str, session_id: str) -> str:
+        """幂等回执 Hash：client_request_id -> 已提交轮次。"""
+        return f"receipt_v1:{self.session_key_id(user_id, session_id)}"
+
     @asynccontextmanager
     async def _session_lock(self, user_id: str, session_id: str) -> AsyncIterator[None]:
         digest = self.session_key_id(user_id, session_id)
         async with self._process_locks.hold(digest):
             # 保留已使用的 Redis 锁前缀，确保重命名后仍与旧实例互斥。
             async with redis_lease(self._client, f"lock:conversation:{digest}"):
+                yield
+
+    @asynccontextmanager
+    async def conversation(self, user_id: str, session_id: str) -> AsyncIterator[None]:
+        """整轮聊天的会话锁；持有期间调用 `commit_turn(lock_held=True)`。"""
+        async with self._session_lock(user_id, session_id):
+            yield
+
+    @asynccontextmanager
+    async def _maybe_session_lock(
+        self, user_id: str, session_id: str, lock_held: bool,
+    ) -> AsyncIterator[None]:
+        if lock_held:
+            yield
+        else:
+            async with self._session_lock(user_id, session_id):
                 yield
 
     async def commit_turn(
@@ -77,14 +104,23 @@ class RedisMemoryStore:
         state: dict[str, Any] | None = None,
         summary: str | None = None,
         metadata: dict[str, Any] | None = None,
+        client_request_id: str | None = None,
+        lock_held: bool = False,
     ) -> Turn | None:
-        """原子提交一轮问答；失败轮次直接返回 None，不写入任何 key。"""
+        """原子提交一轮问答；失败轮次直接返回 None，不写入任何 key。
+
+        `lock_held=True` 表示调用方已持有 `conversation()`，避免锁重入自锁。
+        `client_request_id` 会写入同会话回执 Hash，供重复请求回放。
+        """
         if not succeeded:
             return None
         if state is not None and not isinstance(state, dict):
             raise TypeError("state 必须是字典")
         if summary is not None and not isinstance(summary, str):
             raise TypeError("summary 必须是字符串")
+        if client_request_id is not None:
+            if not isinstance(client_request_id, str) or not client_request_id.strip():
+                raise ValueError("client_request_id 必须是非空字符串")
 
         turn = Turn(
             request_id=request_id,
@@ -96,7 +132,7 @@ class RedisMemoryStore:
         payload = turn.to_json()
         state_payload = None if state is None else _json(state)
 
-        async with self._session_lock(user_id, session_id):
+        async with self._maybe_session_lock(user_id, session_id, lock_held):
             key = self.working_key(user_id, session_id)
             async with self._client.pipeline(transaction=True) as pipe:
                 pipe.lpush(key, payload)
@@ -112,8 +148,21 @@ class RedisMemoryStore:
                     pipe.setex(summary_key, self._ttl_s, summary)
                 else:
                     pipe.expire(summary_key, self._ttl_s)
+                if client_request_id is not None:
+                    receipt_key = self.receipt_key(user_id, session_id)
+                    pipe.hset(receipt_key, client_request_id, payload)
+                    pipe.expire(receipt_key, self._ttl_s)
                 await pipe.execute()
         return turn
+
+    async def get_receipt(
+        self, user_id: str, session_id: str, client_request_id: str,
+    ) -> Turn | None:
+        """读取同一 client_request_id 已提交的轮次；没有则返回 None。"""
+        if not isinstance(client_request_id, str) or not client_request_id.strip():
+            raise ValueError("client_request_id 必须是非空字符串")
+        raw = await self._client.hget(self.receipt_key(user_id, session_id), client_request_id)
+        return Turn.from_json(raw) if raw else None
 
     async def get_turns(
         self,
@@ -259,6 +308,10 @@ class RedisMemoryStore:
         if not isinstance(summary, str):
             raise TypeError("summary 必须是字符串")
         await self._client.setex(self.summary_key(user_id, session_id), self._ttl_s, summary)
+
+    async def ping(self) -> bool:
+        """健康检查；连接失败时由调用方捕获异常。"""
+        return bool(await self._client.ping())
 
     async def close(self) -> None:
         await self._client.aclose()

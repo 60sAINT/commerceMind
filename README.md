@@ -44,24 +44,32 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-## 最小对话链路
+## 对话链路（含短期记忆）
 
-当前只实现一条最小纵向切片：
+当前实现一条纵向切片：
 
 ```text
-HTTP /chat -> 参数校验 -> LLM 调用 -> 文本回复 -> 返回 JSON
+POST /chat -> 读 Redis working memory -> LLM 调用 -> 原子提交本轮 -> 返回 JSON
 ```
 
 接口：
 
 ```http
 GET /health
--> {"status": "ok", "model_configured": true, "model": "...", "detail": null}
+-> {"status": "ok", "model_configured": true, "model": "...",
+    "memory": {"enabled": true, "redis": "ok", "chroma": "ok", "detail": null},
+    "detail": null}
 
 POST /chat
-{"message": "退款一般多久到账？"}
--> {"request_id": "5f2c...", "response": "...", "latency_ms": 123.4}
+{"message": "退款一般多久到账？", "user_id": "u1", "session_id": "c1", "client_request_id": "r1"}
+-> {"request_id": "5f2c...", "session_id": "c1", "response": "...",
+    "latency_ms": 123.4, "input_tokens": 12, "output_tokens": 8}
 ```
+
+- `session_id` 可省略，服务端生成并在响应中返回；后续轮次带同一个 `session_id` 才能续接记忆。
+- `client_request_id` 可省略；同 ID、同消息直接回放上次结果，同 ID 不同消息返回 409。
+- Redis/Chroma 不可用时按无记忆模式继续回答，`/health` 显示 `degraded`；
+  `COMMERCEMIND_MEMORY_REQUIRED=true` 时启动直接失败。
 
 ### 1. 准备配置
 
@@ -145,7 +153,7 @@ pytest -q tests/test_chat_api.py
 - `redis`：短期记忆，宿主机 `6379`，AOF 持久化
 - `chromadb`：长期记忆，宿主机 `8001`，数据卷持久化
 
-记忆业务代码尚未接入，但基础设施已经可以单独启动和健康检查。app 不强制依赖 Redis/Chroma 的健康状态，后续由 `COMMERCEMIND_MEMORY_REQUIRED` 控制降级行为。Nginx 和 Prometheus 仍未编排。
+`/chat` 已接入 Redis 短期记忆；Chroma 目前只参与 `/health` 检查，长期记忆检索尚未接入。app 默认不强制依赖 Redis/Chroma，由 `COMMERCEMIND_MEMORY_REQUIRED` 控制是否允许降级启动。Nginx 和 Prometheus 仍未编排。
 
 ### 构建并启动
 
