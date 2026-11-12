@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import threading
 
 import pytest
 
@@ -685,3 +687,206 @@ def test_resource_methods_raise_for_unknown_skill(tmp_path):
         manager.list_skill_resources("not_exists")
     with pytest.raises(SkillNotFoundError):
         manager.read_skill_resource("not_exists", "references/rules.md")
+
+
+def test_reload_reports_added_updated_removed_and_unchanged(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n旧正文。",
+    )
+    write_skill(
+        tmp_path,
+        "technical_support",
+        front_matter="name: 技术规范\ndescription: 处理技术问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    first_version = manager.catalog.version
+
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款、扣款和发票问题",
+        body="# 账单规范\n\n新正文，长度也变了。",
+    )
+    shutil.rmtree(tmp_path / "technical_support")
+    write_skill(
+        tmp_path,
+        "general_customer_service",
+        front_matter="name: 通用客服规范\ndescription: 处理通用咨询",
+    )
+
+    report = manager.reload()
+
+    assert report.added == ("general_customer_service",)
+    assert report.updated == ("billing_support",)
+    assert report.removed == ("technical_support",)
+    assert report.unchanged == ()
+    assert report.version == first_version + 1
+    assert report.count == 2
+    assert report.errors == ()
+    assert report.duration_ms >= 0
+    assert report.has_changes is True
+    assert manager.last_report is report
+    assert [skill.id for skill in manager.catalog] == [
+        "billing_support",
+        "general_customer_service",
+    ]
+    assert report.to_dict()["errors"] == []
+    assert report.to_dict()["count"] == 2
+
+
+def test_reload_reports_unchanged_skill(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    report = manager.reload()
+
+    assert report.added == ()
+    assert report.updated == ()
+    assert report.removed == ()
+    assert report.unchanged == ("billing_support",)
+    assert report.has_changes is False
+
+
+def test_reload_with_broken_skill_keeps_other_valid_skill(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    write_skill(
+        tmp_path,
+        "technical_support",
+        front_matter="name: 技术规范\ndescription: 处理技术问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    write_skill(
+        tmp_path,
+        "technical_support",
+        front_matter="name: 技术规范",
+        body="# 技术规范\n",
+    )
+    report = manager.reload()
+
+    assert [skill.id for skill in manager.catalog] == ["billing_support"]
+    assert report.removed == ("technical_support",)
+    assert len(report.errors) == 1
+    assert report.errors[0].path == "technical_support/SKILL.md"
+
+
+def test_reload_clears_body_cache(tmp_path, monkeypatch):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n处理步骤。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    calls: list[str] = []
+    original = skill_loader._read_text_limited
+
+    def counting_read(path, max_chars):
+        calls.append(str(path))
+        return original(path, max_chars)
+
+    monkeypatch.setattr(skill_loader, "_read_text_limited", counting_read)
+
+    manager.load_skill("billing_support")
+    manager.reload()
+    manager.load_skill("billing_support")
+
+    assert len(calls) == 2
+
+
+def test_reload_removed_skill_is_not_found(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    manager.load_skill("billing_support")
+
+    shutil.rmtree(tmp_path / "billing_support")
+    report = manager.reload()
+
+    assert report.removed == ("billing_support",)
+    with pytest.raises(SkillNotFoundError):
+        manager.load_skill("billing_support")
+
+
+def test_reload_missing_root_removes_all_skills(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    shutil.rmtree(tmp_path)
+    report = manager.reload()
+
+    assert report.removed == ("billing_support",)
+    assert report.errors == ()
+    assert report.count == 0
+
+
+def test_reload_uses_old_snapshot_until_swap(tmp_path, monkeypatch):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    original_scan = manager._scan_catalog
+
+    def slow_scan(version):
+        scan_started.set()
+        release_scan.wait(2)
+        return original_scan(version)
+
+    monkeypatch.setattr(manager, "_scan_catalog", slow_scan)
+    reports = []
+
+    def run_reload():
+        reports.append(manager.reload())
+
+    thread = threading.Thread(target=run_reload)
+    thread.start()
+    assert scan_started.wait(2)
+
+    # 扫描期间读取方仍然看到完整的旧快照，而不是空目录或半成品。
+    assert [skill.id for skill in manager.catalog] == ["billing_support"]
+
+    write_skill(
+        tmp_path,
+        "general_customer_service",
+        front_matter="name: 通用客服规范\ndescription: 处理通用咨询",
+    )
+    release_scan.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert [skill.id for skill in manager.catalog] == [
+        "billing_support",
+        "general_customer_service",
+    ]
+    assert reports[0].added == ("general_customer_service",)
+    assert reports[0].version == 2

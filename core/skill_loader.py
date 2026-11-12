@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -179,6 +181,38 @@ class SkillCatalog:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SkillReloadReport:
+    """一次热重载的变化报告。"""
+
+    added: tuple[str, ...] = ()
+    updated: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    unchanged: tuple[str, ...] = ()
+    errors: tuple[SkillError, ...] = ()
+    version: int = 0
+    loaded_at: str = ""
+    duration_ms: float = 0.0
+    count: int = 0
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.added or self.updated or self.removed)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "added": list(self.added),
+            "updated": list(self.updated),
+            "removed": list(self.removed),
+            "unchanged": list(self.unchanged),
+            "errors": [error.to_dict() for error in self.errors],
+            "version": self.version,
+            "loaded_at": self.loaded_at,
+            "duration_ms": round(self.duration_ms, 3),
+            "count": self.count,
+        }
+
+
 class SkillManager:
     """发现并管理 `skills/<skill_id>/SKILL.md` 的元数据目录。"""
 
@@ -197,41 +231,54 @@ class SkillManager:
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.max_skill_chars = max_skill_chars
         self.max_resource_chars = max_resource_chars
+        self._lock = threading.RLock()
+        self._reload_lock = threading.Lock()
         self._version = 0
         self._catalog = SkillCatalog(loaded_at=_utc_now())
+        self._last_report = SkillReloadReport()
         # path -> ((mtime_ns, size), body, truncated)
         self._body_cache: dict[str, tuple[tuple[int, int], str, bool]] = {}
 
     @property
     def catalog(self) -> SkillCatalog:
-        return self._catalog
+        with self._lock:
+            return self._catalog
 
     @property
     def skills(self) -> tuple[SkillDescriptor, ...]:
-        return self._catalog.skills
+        return self.catalog.skills
 
     @property
     def errors(self) -> tuple[SkillError, ...]:
-        return self._catalog.errors
+        return self.catalog.errors
+
+    @property
+    def last_report(self) -> SkillReloadReport:
+        with self._lock:
+            return self._last_report
 
     def get(self, skill_id: str) -> SkillDescriptor | None:
-        return self._catalog.get(skill_id)
+        return self.catalog.get(skill_id)
 
     def summary(self) -> dict[str, Any]:
-        return self._catalog.to_summary()
+        return self.catalog.to_summary()
 
     def load_skill(self, skill_id: str) -> SkillDocument:
         """按需读取 Skill 正文，并附带资源清单（不读取资源内容）。"""
-        descriptor = self._require_skill(skill_id)
+        with self._lock:
+            catalog = self._catalog
+        descriptor = self._require_skill(skill_id, catalog)
         path = Path(descriptor.path)
         try:
             stat = path.stat()
         except FileNotFoundError as exc:
-            self._body_cache.pop(descriptor.path, None)
+            with self._lock:
+                self._body_cache.pop(descriptor.path, None)
             raise SkillNotFoundError(f"Skill 文件不存在: {skill_id}") from exc
 
         cache_key = (stat.st_mtime_ns, stat.st_size)
-        cached = self._body_cache.get(descriptor.path)
+        with self._lock:
+            cached = self._body_cache.get(descriptor.path)
         if cached is not None and cached[0] == cache_key:
             body, truncated = cached[1], cached[2]
         else:
@@ -245,18 +292,30 @@ class SkillManager:
             truncated = raw_truncated or len(body) > self.max_skill_chars
             if len(body) > self.max_skill_chars:
                 body = body[: self.max_skill_chars].rstrip()
-            self._body_cache[descriptor.path] = (cache_key, body, truncated)
+            with self._lock:
+                # 读取期间如果发生了 reload，只丢弃这次缓存写入，不用旧快照覆盖新目录。
+                if self._catalog is catalog:
+                    self._body_cache[descriptor.path] = (cache_key, body, truncated)
 
         return SkillDocument(
             descriptor=descriptor,
             body=body,
             truncated=truncated,
-            resources=self.list_skill_resources(skill_id),
+            resources=self._list_resources_for(descriptor),
         )
 
     def list_skill_resources(self, skill_id: str) -> tuple[SkillResourceInfo, ...]:
         """列出 `references/`、`templates/`、`scripts/` 下的资源，不读内容。"""
-        skill_dir = self._skill_dir(skill_id)
+        with self._lock:
+            catalog = self._catalog
+        descriptor = self._require_skill(skill_id, catalog)
+        return self._list_resources_for(descriptor)
+
+    def _list_resources_for(
+        self,
+        descriptor: SkillDescriptor,
+    ) -> tuple[SkillResourceInfo, ...]:
+        skill_dir = Path(descriptor.path).parent.resolve()
         resources: list[SkillResourceInfo] = []
 
         for directory_name in RESOURCE_DIRS:
@@ -284,7 +343,10 @@ class SkillManager:
 
     def read_skill_resource(self, skill_id: str, relative_path: str) -> SkillResource:
         """读取单个资源文本；路径必须位于允许的资源子目录内。"""
-        skill_dir = self._skill_dir(skill_id)
+        with self._lock:
+            catalog = self._catalog
+        descriptor = self._require_skill(skill_id, catalog)
+        skill_dir = Path(descriptor.path).parent.resolve()
         normalized = _normalize_resource_path(relative_path)
         candidate = skill_dir / normalized
 
@@ -320,20 +382,69 @@ class SkillManager:
         )
 
     def load(self) -> SkillCatalog:
-        """扫描目录并替换当前目录快照；失败项不会影响其他 Skill。"""
-        self._version += 1
-        self._body_cache.clear()
+        """兼容入口：执行一次重载并返回最新目录快照。"""
+        self.reload()
+        return self.catalog
+
+    def reload(self) -> SkillReloadReport:
+        """重新扫描目录并原子替换快照，返回本次变化报告。
+
+        扫描阶段不持有读锁，已有请求可以继续使用旧快照；新目录构建完成后
+        再一次性替换。并发 reload 由 `_reload_lock` 串行化。
+        """
+        started = time.perf_counter()
+        with self._reload_lock:
+            with self._lock:
+                previous = self._catalog
+                next_version = self._version + 1
+
+            new_catalog = self._scan_catalog(next_version)
+            added, updated, removed, unchanged = _diff_catalogs(previous, new_catalog)
+            duration_ms = (time.perf_counter() - started) * 1000
+            report = SkillReloadReport(
+                added=added,
+                updated=updated,
+                removed=removed,
+                unchanged=unchanged,
+                errors=new_catalog.errors,
+                version=new_catalog.version,
+                loaded_at=new_catalog.loaded_at,
+                duration_ms=duration_ms,
+                count=len(new_catalog.skills),
+            )
+
+            with self._lock:
+                self._version = next_version
+                self._catalog = new_catalog
+                self._last_report = report
+                # reload 后统一清空正文缓存，避免文件内容变化但 stat 未变时命中旧正文。
+                self._body_cache.clear()
+
+        logger.info(
+            "Skill 目录已重载: root=%s count=%d added=%d updated=%d removed=%d "
+            "errors=%d version=%d duration_ms=%.1f",
+            self.root_dir,
+            report.count,
+            len(report.added),
+            len(report.updated),
+            len(report.removed),
+            len(report.errors),
+            report.version,
+            report.duration_ms,
+        )
+        return report
+
+    def _scan_catalog(self, version: int) -> SkillCatalog:
+        """扫描并构建新目录快照；不修改当前 catalog 和缓存。"""
         errors: list[SkillError] = []
 
         if not self.root_dir.exists():
             logger.info("Skill 目录不存在，按空目录处理: %s", self.root_dir)
-            self._catalog = self._new_catalog((), errors)
-            return self._catalog
+            return SkillCatalog((), (), version, _utc_now())
 
         if not self.root_dir.is_dir():
             errors.append(SkillError(str(self.root_dir), "Skill 根路径不是目录"))
-            self._catalog = self._new_catalog((), errors)
-            return self._catalog
+            return SkillCatalog((), tuple(errors), version, _utc_now())
 
         loaded: list[SkillDescriptor] = []
         seen_ids: set[str] = set()
@@ -356,37 +467,24 @@ class SkillManager:
                 logger.warning("Skill 解析失败: %s: %s", relative, exc)
 
         loaded.sort(key=lambda skill: skill.id)
-        self._catalog = self._new_catalog(tuple(loaded), errors)
-        logger.info(
-            "Skill 目录已加载: root=%s count=%d errors=%d version=%d",
-            self.root_dir,
-            len(loaded),
-            len(errors),
-            self._version,
+        return SkillCatalog(
+            skills=tuple(loaded),
+            errors=tuple(errors),
+            version=version,
+            loaded_at=_utc_now(),
         )
-        return self._catalog
 
-    def _require_skill(self, skill_id: str) -> SkillDescriptor:
-        descriptor = self._catalog.get(skill_id)
+    def _require_skill(
+        self,
+        skill_id: str,
+        catalog: SkillCatalog | None = None,
+    ) -> SkillDescriptor:
+        if catalog is None:
+            catalog = self.catalog
+        descriptor = catalog.get(skill_id)
         if descriptor is None:
             raise SkillNotFoundError(f"Skill 不存在: {skill_id}")
         return descriptor
-
-    def _skill_dir(self, skill_id: str) -> Path:
-        descriptor = self._require_skill(skill_id)
-        return Path(descriptor.path).parent.resolve()
-
-    def _new_catalog(
-        self,
-        skills: tuple[SkillDescriptor, ...],
-        errors: list[SkillError],
-    ) -> SkillCatalog:
-        return SkillCatalog(
-            skills=skills,
-            errors=tuple(errors),
-            version=self._version,
-            loaded_at=_utc_now(),
-        )
 
     def _is_safe_skill_file(self, path: Path) -> bool:
         """拒绝符号链接和逃逸根目录的 SKILL.md。"""
@@ -439,6 +537,42 @@ class SkillManager:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _descriptor_fingerprint(skill: SkillDescriptor) -> tuple[Any, ...]:
+    """用于判断目录项是否变化的轻量指纹，不读取正文。"""
+    return (
+        skill.name,
+        skill.description,
+        skill.keywords,
+        skill.version,
+        skill.enabled,
+        skill.mtime_ns,
+        skill.size,
+    )
+
+
+def _diff_catalogs(
+    previous: SkillCatalog,
+    current: SkillCatalog,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """返回 added / updated / removed / unchanged 四组 skill id。"""
+    old = {skill.id: skill for skill in previous.skills}
+    new = {skill.id: skill for skill in current.skills}
+
+    added = tuple(sorted(set(new) - set(old)))
+    removed = tuple(sorted(set(old) - set(new)))
+    common = set(old) & set(new)
+    updated = tuple(
+        sorted(
+            skill_id
+            for skill_id in common
+            if _descriptor_fingerprint(old[skill_id])
+            != _descriptor_fingerprint(new[skill_id])
+        )
+    )
+    unchanged = tuple(sorted(common - set(updated)))
+    return added, updated, removed, unchanged
 
 
 def _relative_path(path: Path, root: Path) -> str:
