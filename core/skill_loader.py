@@ -1,13 +1,19 @@
-"""Markdown Skill 目录加载器。
+"""Markdown Skill 加载器。
 
-只发现 `skills/<skill_id>/SKILL.md` 并解析轻量元数据，不读取正文和包内
-资源。正文、模板、参考文档和脚本由后续按需加载接口读取，避免启动时把
-所有手册都装进内存或模型上下文。
+发现 `skills/<skill_id>/SKILL.md` 并解析轻量元数据；正文和包内资源只在
+调用方明确请求时读取，避免启动时把所有手册都装进内存或模型上下文。
+
+三层结构：
+1. 目录层：`load()` 只读文件头，生成 `SkillCatalog`；
+2. 正文层：`load_skill()` 按 skill id 读取 `SKILL.md` 正文；
+3. 资源层：`list_skill_resources()` / `read_skill_resource()` 按路径读取
+   `references/`、`templates/`、`scripts/` 里的内容。
 
 设计约束：
 - front matter 只支持项目需要的最小子集，不引入 PyYAML。
 - 单个 Skill 解析失败只记录到 `errors`，不影响其他 Skill。
-- 目录扫描只读文件头，大段正文不会在这里进入内存。
+- 资源读取拒绝绝对路径、`..`、隐藏文件和符号链接逃逸。
+- 脚本只作为文本返回，不在这里执行。
 """
 from __future__ import annotations
 
@@ -15,16 +21,36 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 SKILL_FILENAME = "SKILL.md"
 MAX_HEADER_CHARS = 8 * 1024
+DEFAULT_MAX_SKILL_CHARS = 8 * 1024
+DEFAULT_MAX_RESOURCE_CHARS = 20 * 1024
+RESOURCE_DIRS = ("references", "templates", "scripts")
+_RESOURCE_DIR_SET = frozenset(RESOURCE_DIRS)
 _SKILL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+
+
+class SkillNotFoundError(LookupError):
+    """请求的 Skill id 不在当前目录中。"""
+
+
+class SkillResourceNotFoundError(LookupError):
+    """请求的资源文件不存在。"""
+
+
+class SkillResourceAccessError(ValueError):
+    """资源路径非法、越界或不是可读取的文本文件。"""
+
+
+class SkillBodyError(ValueError):
+    """Skill 正文为空或无法解析。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +96,58 @@ class SkillDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillResourceInfo:
+    """资源清单项，只包含路径和大小，不包含内容。"""
+
+    relative_path: str
+    size_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.relative_path,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SkillDocument:
+    """按需加载后的 Skill 正文及其资源清单。"""
+
+    descriptor: SkillDescriptor
+    body: str
+    truncated: bool = False
+    resources: tuple[SkillResourceInfo, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "skill": self.descriptor.to_summary(),
+            "body": self.body,
+            "truncated": self.truncated,
+            "resources": [resource.to_dict() for resource in self.resources],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SkillResource:
+    """按需读取后的单个资源内容。"""
+
+    skill_id: str
+    relative_path: str
+    content: str
+    size_bytes: int
+    truncated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "path": self.relative_path,
+            "content": self.content,
+            "size_bytes": self.size_bytes,
+            "truncated": self.truncated,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SkillCatalog:
     """一次扫描得到的 Skill 目录快照。"""
 
@@ -104,10 +182,25 @@ class SkillCatalog:
 class SkillManager:
     """发现并管理 `skills/<skill_id>/SKILL.md` 的元数据目录。"""
 
-    def __init__(self, root_dir: str | Path = "skills") -> None:
+    def __init__(
+        self,
+        root_dir: str | Path = "skills",
+        *,
+        max_skill_chars: int = DEFAULT_MAX_SKILL_CHARS,
+        max_resource_chars: int = DEFAULT_MAX_RESOURCE_CHARS,
+    ) -> None:
+        if max_skill_chars <= 0:
+            raise ValueError("max_skill_chars 必须大于 0")
+        if max_resource_chars <= 0:
+            raise ValueError("max_resource_chars 必须大于 0")
+
         self.root_dir = Path(root_dir).expanduser().resolve()
+        self.max_skill_chars = max_skill_chars
+        self.max_resource_chars = max_resource_chars
         self._version = 0
         self._catalog = SkillCatalog(loaded_at=_utc_now())
+        # path -> ((mtime_ns, size), body, truncated)
+        self._body_cache: dict[str, tuple[tuple[int, int], str, bool]] = {}
 
     @property
     def catalog(self) -> SkillCatalog:
@@ -127,9 +220,109 @@ class SkillManager:
     def summary(self) -> dict[str, Any]:
         return self._catalog.to_summary()
 
+    def load_skill(self, skill_id: str) -> SkillDocument:
+        """按需读取 Skill 正文，并附带资源清单（不读取资源内容）。"""
+        descriptor = self._require_skill(skill_id)
+        path = Path(descriptor.path)
+        try:
+            stat = path.stat()
+        except FileNotFoundError as exc:
+            self._body_cache.pop(descriptor.path, None)
+            raise SkillNotFoundError(f"Skill 文件不存在: {skill_id}") from exc
+
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._body_cache.get(descriptor.path)
+        if cached is not None and cached[0] == cache_key:
+            body, truncated = cached[1], cached[2]
+        else:
+            raw, raw_truncated = _read_text_limited(
+                path, self.max_skill_chars + MAX_HEADER_CHARS
+            )
+            _, body_part = _split_front_matter(raw)
+            body = body_part.strip()
+            if not body:
+                raise SkillBodyError(f"Skill 正文为空: {skill_id}")
+            truncated = raw_truncated or len(body) > self.max_skill_chars
+            if len(body) > self.max_skill_chars:
+                body = body[: self.max_skill_chars].rstrip()
+            self._body_cache[descriptor.path] = (cache_key, body, truncated)
+
+        return SkillDocument(
+            descriptor=descriptor,
+            body=body,
+            truncated=truncated,
+            resources=self.list_skill_resources(skill_id),
+        )
+
+    def list_skill_resources(self, skill_id: str) -> tuple[SkillResourceInfo, ...]:
+        """列出 `references/`、`templates/`、`scripts/` 下的资源，不读内容。"""
+        skill_dir = self._skill_dir(skill_id)
+        resources: list[SkillResourceInfo] = []
+
+        for directory_name in RESOURCE_DIRS:
+            directory = skill_dir / directory_name
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if not path.is_file() or _has_hidden_part(path.relative_to(skill_dir)):
+                    continue
+                if not _is_safe_resource_path(skill_dir, path):
+                    continue
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                resources.append(
+                    SkillResourceInfo(
+                        relative_path=path.relative_to(skill_dir).as_posix(),
+                        size_bytes=size,
+                    )
+                )
+
+        resources.sort(key=lambda item: item.relative_path)
+        return tuple(resources)
+
+    def read_skill_resource(self, skill_id: str, relative_path: str) -> SkillResource:
+        """读取单个资源文本；路径必须位于允许的资源子目录内。"""
+        skill_dir = self._skill_dir(skill_id)
+        normalized = _normalize_resource_path(relative_path)
+        candidate = skill_dir / normalized
+
+        if not _is_safe_resource_path(skill_dir, candidate):
+            raise SkillResourceAccessError("资源路径越界或不是普通文件")
+        if candidate.is_symlink():
+            raise SkillResourceAccessError("资源文件不能是符号链接")
+        if not candidate.is_file():
+            raise SkillResourceNotFoundError(
+                f"资源不存在: {skill_id}/{normalized}"
+            )
+
+        try:
+            content, truncated = _read_text_limited(
+                candidate, self.max_resource_chars
+            )
+            if "\x00" in content:
+                raise SkillResourceAccessError("资源不是文本文件")
+            stat = candidate.stat()
+        except SkillResourceAccessError:
+            raise
+        except FileNotFoundError as exc:
+            raise SkillResourceNotFoundError(
+                f"资源不存在: {skill_id}/{normalized}"
+            ) from exc
+
+        return SkillResource(
+            skill_id=skill_id,
+            relative_path=normalized,
+            content=content,
+            size_bytes=stat.st_size,
+            truncated=truncated,
+        )
+
     def load(self) -> SkillCatalog:
         """扫描目录并替换当前目录快照；失败项不会影响其他 Skill。"""
         self._version += 1
+        self._body_cache.clear()
         errors: list[SkillError] = []
 
         if not self.root_dir.exists():
@@ -172,6 +365,16 @@ class SkillManager:
             self._version,
         )
         return self._catalog
+
+    def _require_skill(self, skill_id: str) -> SkillDescriptor:
+        descriptor = self._catalog.get(skill_id)
+        if descriptor is None:
+            raise SkillNotFoundError(f"Skill 不存在: {skill_id}")
+        return descriptor
+
+    def _skill_dir(self, skill_id: str) -> Path:
+        descriptor = self._require_skill(skill_id)
+        return Path(descriptor.path).parent.resolve()
 
     def _new_catalog(
         self,
@@ -249,6 +452,51 @@ def _read_header(path: Path) -> str:
     """只读取文件头，front matter 和回退标题都应落在这一段里。"""
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         return handle.read(MAX_HEADER_CHARS)
+
+
+def _read_text_limited(path: Path, max_chars: int) -> tuple[str, bool]:
+    """最多读取 max_chars 个字符，并返回是否被截断。"""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        text = handle.read(max_chars + 1)
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _has_hidden_part(relative: Path) -> bool:
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def _normalize_resource_path(relative_path: str) -> str:
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise SkillResourceAccessError("资源路径不能为空")
+    text = relative_path.strip()
+    if "\x00" in text:
+        raise SkillResourceAccessError("资源路径包含非法字符")
+    if "\\" in text:
+        raise SkillResourceAccessError("资源路径必须使用正斜杠")
+
+    pure = PurePosixPath(text)
+    if pure.is_absolute():
+        raise SkillResourceAccessError("资源路径不能是绝对路径")
+    parts = pure.parts
+    if not parts:
+        raise SkillResourceAccessError("资源路径不能为空")
+    if any(part in {"", ".", ".."} or part.startswith(".") for part in parts):
+        raise SkillResourceAccessError("资源路径不能包含隐藏目录或 ..")
+    if parts[0] not in _RESOURCE_DIR_SET:
+        raise SkillResourceAccessError(
+            f"资源只能从 {', '.join(RESOURCE_DIRS)} 读取"
+        )
+    return pure.as_posix()
+
+
+def _is_safe_resource_path(skill_dir: Path, path: Path) -> bool:
+    try:
+        path.resolve().relative_to(skill_dir.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _split_front_matter(raw: str) -> tuple[dict[str, Any], str]:

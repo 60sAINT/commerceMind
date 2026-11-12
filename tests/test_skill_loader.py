@@ -1,11 +1,18 @@
-"""Skill 目录与 front matter 解析测试。"""
+"""Skill 目录、正文与资源按需加载测试。"""
 from __future__ import annotations
 
 import os
 
 import pytest
 
-from core.skill_loader import SkillManager
+import core.skill_loader as skill_loader
+from core.skill_loader import (
+    SkillBodyError,
+    SkillManager,
+    SkillNotFoundError,
+    SkillResourceAccessError,
+    SkillResourceNotFoundError,
+)
 
 
 def write_skill(
@@ -16,7 +23,7 @@ def write_skill(
     body: str = "# 示例 Skill\n\n处理示例问题。",
 ) -> None:
     directory = root / skill_id
-    directory.mkdir(parents=True)
+    directory.mkdir(parents=True, exist_ok=True)
     content = ""
     if front_matter is not None:
         content += f"---\n{front_matter.strip()}\n---\n\n"
@@ -355,3 +362,326 @@ def test_invalid_enabled_value_reports_error(tmp_path):
     assert len(catalog) == 0
     assert len(catalog.errors) == 1
     assert "enabled" in catalog.errors[0].message
+
+
+def write_resource(root, skill_id: str, relative_path: str, content: str) -> None:
+    path = root / skill_id / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def test_load_skill_reads_body_without_front_matter(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n1. 确认订单。\n2. 说明退款时效。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    document = manager.load_skill("billing_support")
+
+    assert document.body == "# 账单规范\n\n1. 确认订单。\n2. 说明退款时效。"
+    assert document.truncated is False
+    assert document.descriptor.id == "billing_support"
+
+
+def test_load_skill_returns_resource_inventory_without_content(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n查看 references/refund-policy.md。",
+    )
+    write_resource(tmp_path, "billing_support", "references/refund-policy.md", "退款规则")
+    write_resource(tmp_path, "billing_support", "templates/reply.md", "回复模板")
+    write_resource(tmp_path, "billing_support", "scripts/check.py", "print('check')")
+    write_resource(tmp_path, "billing_support", "private/secret.txt", "不应该出现")
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    document = manager.load_skill("billing_support")
+
+    assert [item.relative_path for item in document.resources] == [
+        "references/refund-policy.md",
+        "scripts/check.py",
+        "templates/reply.md",
+    ]
+    assert all(item.size_bytes > 0 for item in document.resources)
+    assert not hasattr(document.resources[0], "content")
+
+
+def test_body_cache_avoids_repeated_reads(tmp_path, monkeypatch):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n处理步骤。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    calls: list[str] = []
+    original = skill_loader._read_text_limited
+
+    def counting_read(path, max_chars):
+        calls.append(str(path))
+        return original(path, max_chars)
+
+    monkeypatch.setattr(skill_loader, "_read_text_limited", counting_read)
+
+    first = manager.load_skill("billing_support")
+    second = manager.load_skill("billing_support")
+
+    assert first.body == second.body
+    assert len(calls) == 1
+
+
+def test_body_cache_invalidates_when_file_changes(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 第一版\n\n旧内容。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    assert "旧内容" in manager.load_skill("billing_support").body
+
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 第二版\n\n新内容，长度已经变化。",
+    )
+
+    assert "新内容" in manager.load_skill("billing_support").body
+
+
+def test_load_clears_body_cache(tmp_path, monkeypatch):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 账单规范\n\n处理步骤。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    calls: list[str] = []
+    original = skill_loader._read_text_limited
+
+    def counting_read(path, max_chars):
+        calls.append(str(path))
+        return original(path, max_chars)
+
+    monkeypatch.setattr(skill_loader, "_read_text_limited", counting_read)
+
+    manager.load_skill("billing_support")
+    manager.load()
+    manager.load_skill("billing_support")
+
+    assert len(calls) == 2
+
+
+def test_body_is_truncated_at_limit(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="# 0123456789ABCDEF",
+    )
+    manager = SkillManager(tmp_path, max_skill_chars=10)
+    manager.load()
+
+    document = manager.load_skill("billing_support")
+
+    assert document.truncated is True
+    assert len(document.body) <= 10
+
+
+def test_empty_body_after_front_matter_raises(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+        body="",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillBodyError):
+        manager.load_skill("billing_support")
+
+
+def test_unknown_skill_raises(tmp_path):
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillNotFoundError):
+        manager.load_skill("not_exists")
+
+
+def test_deleted_skill_file_raises(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+    (tmp_path / "billing_support" / "SKILL.md").unlink()
+
+    with pytest.raises(SkillNotFoundError):
+        manager.load_skill("billing_support")
+
+
+def test_list_resources_skips_hidden_and_disallowed_paths(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    write_resource(tmp_path, "billing_support", "references/rules.md", "规则")
+    write_resource(tmp_path, "billing_support", "references/.hidden.md", "隐藏")
+    write_resource(tmp_path, "billing_support", "references/nested/deep.md", "嵌套")
+    write_resource(tmp_path, "billing_support", "private/secret.txt", "私有")
+    write_resource(tmp_path, "billing_support", "notes.md", "根目录笔记")
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    resources = manager.list_skill_resources("billing_support")
+
+    assert [item.relative_path for item in resources] == [
+        "references/nested/deep.md",
+        "references/rules.md",
+    ]
+
+
+def test_read_resource_returns_content_and_size(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    write_resource(
+        tmp_path,
+        "billing_support",
+        "references/refund-policy.md",
+        "退款通常原路退回。",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    resource = manager.read_skill_resource(
+        "billing_support", "references/refund-policy.md"
+    )
+
+    assert resource.content == "退款通常原路退回。"
+    assert resource.size_bytes > 0
+    assert resource.truncated is False
+    assert resource.relative_path == "references/refund-policy.md"
+
+
+def test_resource_is_truncated_at_limit(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    write_resource(tmp_path, "billing_support", "references/rules.md", "0123456789")
+    manager = SkillManager(tmp_path, max_resource_chars=5)
+    manager.load()
+
+    resource = manager.read_skill_resource("billing_support", "references/rules.md")
+
+    assert resource.truncated is True
+    assert resource.content == "01234"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "",
+        "../secret.txt",
+        "/etc/passwd",
+        "references/../../secret.txt",
+        "references/../templates/reply.md",
+        "private/secret.txt",
+        "SKILL.md",
+        "references\\rules.md",
+        "references/.hidden.md",
+    ],
+)
+def test_invalid_resource_paths_are_rejected(tmp_path, relative_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    write_resource(tmp_path, "billing_support", "references/rules.md", "规则")
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillResourceAccessError):
+        manager.read_skill_resource("billing_support", relative_path)
+
+
+def test_missing_resource_raises(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillResourceNotFoundError):
+        manager.read_skill_resource("billing_support", "references/not-exists.md")
+
+
+def test_binary_resource_is_rejected(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    path = tmp_path / "billing_support" / "references" / "binary.bin"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"abc\x00def")
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillResourceAccessError):
+        manager.read_skill_resource("billing_support", "references/binary.bin")
+
+
+def test_symlink_resource_is_rejected(tmp_path):
+    write_skill(
+        tmp_path,
+        "billing_support",
+        front_matter="name: 账单规范\ndescription: 处理退款问题",
+    )
+    external = tmp_path / "outside.md"
+    external.write_text("外部内容", encoding="utf-8")
+    link = tmp_path / "billing_support" / "references" / "link.md"
+    link.parent.mkdir(parents=True)
+    try:
+        os.symlink(external, link)
+    except OSError:
+        pytest.skip("当前文件系统不支持符号链接")
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillResourceAccessError):
+        manager.read_skill_resource("billing_support", "references/link.md")
+    assert manager.list_skill_resources("billing_support") == ()
+
+
+def test_resource_methods_raise_for_unknown_skill(tmp_path):
+    manager = SkillManager(tmp_path)
+    manager.load()
+
+    with pytest.raises(SkillNotFoundError):
+        manager.list_skill_resources("not_exists")
+    with pytest.raises(SkillNotFoundError):
+        manager.read_skill_resource("not_exists", "references/rules.md")
