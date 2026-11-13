@@ -1,0 +1,40 @@
+/* Tailwind v4：工具类负责布局与状态，Less 负责令牌与复杂样式。 */
+@import 'tailwindcss';
+
+/* 用 class 控制暗色，便于后续做 light / dark / system 三态切换。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-canvas: var(--cm-canvas);
+  --color-sidebar: var(--cm-sidebar);
+  --color-elevated: var(--cm-elevated);
+  --color-soft: var(--cm-soft);
+  --color-hover: var(--cm-hover);
+  --color-ink: var(--cm-ink);
+  --color-muted: var(--cm-muted);
+  --color-faint: var(--cm-faint);
+  --color-line: var(--cm-line);
+  --color-line-strong: var(--cm-line-strong);
+  --color-success: var(--cm-success);
+  --color-danger: var(--cm-danger);
+  --color-code: var(--cm-code);
+
+  --font-sans: var(--cm-font-sans);
+  --font-mono: var(--cm-font-mono);
+
+  --radius-card: 12px;
+  --radius-panel: 16px;
+
+  --shadow-soft: var(--cm-shadow-soft);
+  --shadow-float: var(--cm-shadow-float);
+}
+
+@layer base {
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+}

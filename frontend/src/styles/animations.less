@@ -1,0 +1,39 @@
+// 全局动画统一加 cm- 前缀，避免和 Tailwind 工具类重名。
+@keyframes cm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes cm-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes cm-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.cm-spin {
+  animation: cm-spin 1s linear infinite;
+}
+
+.cm-breathe {
+  animation: cm-breathe 1.2s ease-in-out infinite;
+}
+
+.cm-fade-up {
+  animation: cm-fade-up 0.35s ease-out both;
+}

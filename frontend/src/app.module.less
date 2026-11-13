@@ -1,0 +1,44 @@
+// 仅存放需要复杂选择器的样式；普通布局与配色一律用 Tailwind。
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(var(--cm-line) 0.75px, transparent 0.75px);
+  background-size: 22px 22px;
+  opacity: 0.55;
+  mask-image: radial-gradient(ellipse 75% 55% at 50% 0%, #000 8%, transparent 72%);
+}
+
+.brandMark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  border-radius: 11px;
+  background: var(--cm-ink);
+  color: var(--cm-canvas);
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.05em;
+  box-shadow: var(--cm-shadow-soft);
+}
+
+.stackRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tokenGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (min-width: 640px) {
+  .tokenGrid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
