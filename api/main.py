@@ -1,9 +1,10 @@
 """CommerceMind FastAPI 入口：LLM 对话 + 短期多轮记忆。
 
-当前阶段包含两条链路：
+当前阶段包含以下链路：
 
     GET  /health  -> 检查服务、模型和记忆依赖（Redis/Chroma）
     POST /chat    -> 读 working memory -> 调用 LLM -> 原子提交本轮
+    GET  /skills  -> Skill 轻量目录；POST /skills/reload 仅在 Skills debug 开启时注册
 
 不包含意图识别、Agent 路由、RAG、MCP 和监控；长期记忆检索暂未接入。
 """
@@ -29,6 +30,8 @@ from core.intent_fusion import combine_intents
 from core.intent_llm import IntentLLMClassifier
 from core.intent_pattern import recognize_pattern
 from core.llm import SYSTEM_PROMPT, ChatResult, LLMClient, LLMError
+from core.skill_loader import SkillBodyError, SkillManager, SkillNotFoundError
+from core.skill_selection import parse_skill_commands, select_skills
 from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
 
@@ -57,6 +60,16 @@ class ChatRequest(BaseModel):
     user_id: str = Field(default="anonymous", min_length=1, max_length=128)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
     client_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    skill_ids: list[str] | None = None
+
+    @field_validator("skill_ids")
+    @classmethod
+    def normalize_skill_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if any(not item.strip() or len(item.strip()) > 64 for item in value):
+            raise ValueError("skill_ids 必须包含非空且不超过 64 字符的 id")
+        return list(dict.fromkeys(item.strip() for item in value))
 
     @field_validator("message", "user_id", "session_id", "client_request_id")
     @classmethod
@@ -162,6 +175,33 @@ async def _recognize_intent(message: str, llm: LLMClient, settings, *, history=N
     return combine_intents(candidates, settings)
 
 
+def _skill_system_prompt(
+    manager: SkillManager, selected: list[str], catalog_max_chars: int,
+) -> str:
+    """目录始终注入；选中后才读取正文，不读取资源内容。"""
+    catalog = manager.catalog
+    for skill_id in selected:
+        if catalog.get(skill_id) is None:
+            raise SkillNotFoundError(skill_id)
+    entries = [
+        f"- {skill.id}: {skill.name} — {skill.description}"
+        for skill in catalog.skills
+    ]
+    catalog_text = "Skills 轻量目录（名称和描述；仅选中后加载正文）：\n"
+    catalog_text += "\n".join(entries) if entries else "（空目录）"
+    catalog_text = catalog_text[:catalog_max_chars]
+    blocks = [SYSTEM_PROMPT, catalog_text]
+    if selected:
+        blocks.append("以下为本轮选中的 Skill 业务说明；系统角色与安全边界优先。")
+        for skill_id in selected:
+            document = manager.load_skill(skill_id)
+            block = f"### Skill: {skill_id}\n{document.body}"
+            if document.truncated:
+                block += "\n[正文已截断]"
+            blocks.append(block)
+    return "\n\n".join(blocks)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -207,6 +247,32 @@ def create_app(
     app.state.settings = settings
     app.state.llm = llm
     app.state.memory = memory
+    app.state.skill_manager = None
+    if settings.skills.enabled:
+        manager = SkillManager(
+            settings.skills.root_dir,
+            max_skill_chars=settings.skills.body_max_chars,
+            max_resource_chars=settings.skills.resource_max_chars,
+            strict_front_matter=True,
+        )
+        manager.load()
+        app.state.skill_manager = manager
+
+    @app.get("/skills", tags=["Skills"])
+    async def skills_summary() -> dict[str, Any]:
+        manager = app.state.skill_manager
+        if manager is None:
+            return {
+                "enabled": False, "count": 0, "skills": [],
+                "errors": [], "version": 0, "loaded_at": "",
+            }
+        return {"enabled": True, **manager.summary()}
+
+    if settings.skills.enabled and settings.skills.debug:
+        @app.post("/skills/reload", tags=["Skills"])
+        async def reload_skills() -> dict[str, Any]:
+            report = await asyncio.to_thread(app.state.skill_manager.reload)
+            return report.to_dict()
 
     if settings.model_configured:
         logger.info(
@@ -269,6 +335,37 @@ def create_app(
         memory: ConversationMemory | None = request.app.state.memory
         session_id = req.session_id or uuid.uuid4().hex[:16]
         replayed = None
+
+        skill_system: str | None = None
+        manager = request.app.state.skill_manager
+        if manager is not None:
+            commands, message = parse_skill_commands(req.message)
+            if commands and not message:
+                return _error_response(
+                    request_id, 422, "选择 Skill 后请输入问题",
+                    error_code="skill_message_required",
+                )
+            selected = list(dict.fromkeys([*(req.skill_ids or []), *commands]))
+            manual_selection = req.skill_ids is not None or bool(commands)
+            if len(selected) > settings.skills.max_selected_skills:
+                return _error_response(
+                    request_id, 422, "选择的 Skill 数量超过限制",
+                    error_code="too_many_skills",
+                )
+            try:
+                skill_system = await asyncio.to_thread(
+                    _skill_system_prompt, manager, selected, settings.skills.catalog_max_chars,
+                )
+            except SkillNotFoundError:
+                return _error_response(
+                    request_id, 404, "指定的 Skill 不存在或已不可用",
+                    error_code="skill_not_found",
+                )
+            except (SkillBodyError, OSError, ValueError):
+                return _error_response(
+                    request_id, 503, "指定的 Skill 正文不可用，请重载目录或检查文件",
+                    error_code="skill_unavailable",
+                )
 
         # 先按 client_request_id 回到原会话：重试不带 session_id 也能回放。
         if memory is not None and req.client_request_id:
@@ -399,12 +496,17 @@ def create_app(
                         )
 
                 if context is None:
-                    result = await llm.chat(req.message)
+                    result = await llm.chat(
+                        message if manager is not None else req.message,
+                        **({"system": skill_system} if skill_system is not None else {}),
+                    )
                 else:
                     result = await llm.chat(
-                        req.message,
+                        message if manager is not None else req.message,
                         history=list(context.recent_messages),
-                        system=context.to_system_text(SYSTEM_PROMPT),
+                        system=context.to_system_text(
+                            skill_system if skill_system is not None else SYSTEM_PROMPT,
+                        ),
                     )
                 text = _result_text(result)
                 input_tokens, output_tokens = _result_usage(result)
@@ -441,8 +543,31 @@ def create_app(
                 )
 
         try:
+            if manager is not None and not manual_selection:
+                selected = await select_skills(
+                    req.message, manager.catalog, llm,
+                    max_selected=settings.skills.max_selected_skills,
+                    max_chars=settings.skills.catalog_max_chars,
+                )
+                try:
+                    skill_system = await asyncio.to_thread(
+                        _skill_system_prompt, manager, selected, settings.skills.catalog_max_chars,
+                    )
+                except SkillNotFoundError:
+                    return _error_response(
+                        request_id, 404, "指定的 Skill 不存在或已不可用",
+                        error_code="skill_not_found",
+                    )
+                except (SkillBodyError, OSError, ValueError):
+                    return _error_response(
+                        request_id, 503, "指定的 Skill 正文不可用，请重载目录或检查文件",
+                        error_code="skill_unavailable",
+                    )
             if memory is None:
-                result = await llm.chat(req.message)
+                result = await llm.chat(
+                    message if manager is not None else req.message,
+                    **({"system": skill_system} if skill_system is not None else {}),
+                )
                 text = _result_text(result)
                 input_tokens, output_tokens = _result_usage(result)
                 latency_ms = (time.perf_counter() - started) * 1000

@@ -34,6 +34,7 @@ COPY --chown=commercemind:commercemind api ./api
 COPY --chown=commercemind:commercemind core ./core
 COPY --chown=commercemind:commercemind memory ./memory
 COPY --chown=commercemind:commercemind data ./data
+COPY --chown=commercemind:commercemind skills ./skills
 
 # ChromaDB 本地嵌入式模式需要可写目录；连接独立 chromadb 服务时不使用。
 RUN mkdir -p /app/data/chroma && \

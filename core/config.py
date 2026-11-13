@@ -109,6 +109,28 @@ class IntentSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillSettings:
+    """Skill 目录和按需正文预算；默认关闭以保持原聊天行为。"""
+
+    enabled: bool = False
+    root_dir: str = "skills"
+    catalog_max_chars: int = 4000
+    body_max_chars: int = 8192
+    resource_max_chars: int = 20480
+    max_selected_skills: int = 3
+    debug: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "root_dir", str(self.root_dir).strip())
+        if not self.root_dir:
+            raise ValueError("Skill root_dir 不能为空")
+        for name in ("catalog_max_chars", "body_max_chars", "resource_max_chars", "max_selected_skills"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} 必须是正整数")
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """运行期配置。
 
@@ -127,6 +149,7 @@ class Settings:
     max_tokens: int = DEFAULT_MAX_TOKENS
     memory: MemorySettings = field(default_factory=MemorySettings)
     intent: IntentSettings = field(default_factory=IntentSettings)
+    skills: SkillSettings = field(default_factory=SkillSettings)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "api_key", self.api_key.strip())
@@ -153,6 +176,15 @@ class Settings:
             model=os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL),
             timeout_s=_env_float("COMMERCEMIND_LLM_TIMEOUT_S", DEFAULT_TIMEOUT_S),
             max_tokens=_env_int("COMMERCEMIND_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+            skills=SkillSettings(
+                enabled=_env_bool("COMMERCEMIND_SKILLS_ENABLED", False),
+                root_dir=os.getenv("COMMERCEMIND_SKILLS_ROOT_DIR", "skills"),
+                catalog_max_chars=_env_int("COMMERCEMIND_SKILLS_CATALOG_MAX_CHARS", 4000),
+                body_max_chars=_env_int("COMMERCEMIND_SKILLS_BODY_MAX_CHARS", 8192),
+                resource_max_chars=_env_int("COMMERCEMIND_SKILLS_RESOURCE_MAX_CHARS", 20480),
+                max_selected_skills=_env_int("COMMERCEMIND_SKILLS_MAX_SELECTED_SKILLS", 3),
+                debug=_env_bool("COMMERCEMIND_SKILLS_DEBUG", False),
+            ),
             memory=MemorySettings(
                 enabled=_env_bool("COMMERCEMIND_MEMORY_ENABLED", False),
                 required=_env_bool("COMMERCEMIND_MEMORY_REQUIRED", False),

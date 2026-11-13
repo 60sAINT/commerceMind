@@ -222,6 +222,7 @@ class SkillManager:
         *,
         max_skill_chars: int = DEFAULT_MAX_SKILL_CHARS,
         max_resource_chars: int = DEFAULT_MAX_RESOURCE_CHARS,
+        strict_front_matter: bool = False,
     ) -> None:
         if max_skill_chars <= 0:
             raise ValueError("max_skill_chars 必须大于 0")
@@ -231,6 +232,7 @@ class SkillManager:
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.max_skill_chars = max_skill_chars
         self.max_resource_chars = max_resource_chars
+        self.strict_front_matter = strict_front_matter
         self._lock = threading.RLock()
         self._reload_lock = threading.Lock()
         self._version = 0
@@ -498,8 +500,10 @@ class SkillManager:
 
     def _load_metadata(self, path: Path) -> SkillDescriptor | None:
         """只读取文件头并解析元数据；enabled=false 时返回 None。"""
-        raw = _read_header(path)
+        raw = _read_front_matter_only(path) if self.strict_front_matter else _read_header(path)
         meta, body_prefix = _split_front_matter(raw)
+        if self.strict_front_matter and not all(str(meta.get(key) or "").strip() for key in ("name", "description")):
+            raise ValueError("Skill YAML front matter 必须包含 name 和 description")
 
         skill_id = path.parent.name
         if not _SKILL_ID_PATTERN.fullmatch(skill_id):
@@ -586,6 +590,29 @@ def _read_header(path: Path) -> str:
     """只读取文件头，front matter 和回退标题都应落在这一段里。"""
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         return handle.read(MAX_HEADER_CHARS)
+
+
+def _read_front_matter_only(path: Path) -> str:
+    """API 启动只消费 front matter，到闭合分隔符即停止，不读取正文。"""
+    lines: list[str] = []
+    length = 0
+    opened = False
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        while length < MAX_HEADER_CHARS:
+            line = handle.readline(MAX_HEADER_CHARS - length)
+            if not line:
+                break
+            length += len(line)
+            lines.append(line)
+            if not opened:
+                if not line.strip():
+                    continue
+                if line.strip() != "---":
+                    raise ValueError("Skill 必须以 YAML front matter 开头")
+                opened = True
+            elif line.strip() == "---":
+                return "".join(lines)
+    raise ValueError("Skill front matter 未闭合或超过字符上限")
 
 
 def _read_text_limited(path: Path, max_chars: int) -> tuple[str, bool]:

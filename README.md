@@ -271,3 +271,72 @@ docker compose up -d --force-recreate commercemind
 - 评测与监控
 
 配置项说明见 [.env.example](.env.example)。
+
+## Skills 渐进加载、自动匹配与手动选择
+
+设置 `COMMERCEMIND_SKILLS_ENABLED=true` 后，应用创建时扫描
+`COMMERCEMIND_SKILLS_ROOT_DIR`（默认 `skills`，相对服务工作目录）。
+复用 `SkillManager` 的元数据快照、正文按需加载和原子重载机制；参考 EchoMind
+的启动和管理接口方式，聊天使用轻量目录、description 语义选择和正文按需加载。
+
+每个包使用 `skills/<skill_id>/SKILL.md`，front matter 支持 `name`、
+`description`、`keywords`、`version`、`enabled`。API 要求 frontmatter 提供非空的
+`name` 和 `description`，遇到闭合分隔符即停止读取，不从正文回退。目录中的 id 就是文件夹名。
+名称和描述用于模型选择；keywords 不参与选择，也不注入模型目录。
+`references/`、`templates/`、`scripts/` 保存按需资源；脚本不会自动执行。
+
+- Skills 开启后，`/chat` 的 system 始终包含轻量目录（id、名称、描述），包括无记忆、有记忆及记忆读取失败的路径。
+- 不传 `skill_ids` 或传 `null`，且消息没有手动命令时，先调用模型根据 description 做语义选择。选择阶段只看到名称、描述和 id，不读取正文或资源。只有通过校验的选中 id 才会触发正文加载。
+- 手动选择有两种方式：消息开头输入 `/billing_support 问题内容`；或请求传 `skill_ids`。二者合并去重并跳过自动选择。支持 `/billing_support /technical_support 问题内容`。
+- 显式传 `skill_ids: []` 可关闭本轮自动选择（消息有 slash 命令时仍执行手动选择）。
+- 每轮重新选技，不把选中状态永久绑定到会话。正文按需加载并缓存，加入 system 时保留原有系统角色和记忆上下文；不读取包内资源内容。
+- 自动选择最多额外调用一次模型，最多等待 8 秒；未匹配、超时、调用失败或返回非法/越界 id 时不加载正文，继续普通回答。选择目录 JSON 受目录预算限制，放不下的条目跳过；完整目录可通过 GET 获取并手动选择。
+- 当前仓库只有后端；前端输入 `/` 时可调用 `GET /skills` 获取候选项，选中后发送 `/skill_id 问题内容` 或 `skill_ids`。尚无前端弹出菜单组件。单独发送 `/billing_support` 返回 `422 skill_message_required`，需附带问题。
+- 原始消息保留在记忆与幂等回执中；发给本轮回答模型的问题去除开头的 Skill 命令。
+- Skills 关闭时，不创建管理器，不注入目录或正文，忽略 `skill_ids`，原有模型调用与记忆行为保持不变。
+
+```bash
+curl http://localhost:8000/skills
+curl -X POST http://localhost:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"退款一般多久到账？"}'
+# 手动选择（跳过自动选择模型调用）
+curl -X POST http://localhost:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"/billing_support 退款一般多久到账？"}'
+```
+
+`GET /skills` 返回 `enabled/count/skills/errors/version/loaded_at`，
+只包含元数据摘要，不包含正文、资源内容或正常目录项的服务器绝对路径。
+关闭时返回 `enabled=false`、空目录、版本 0。
+未知或已删除的 Skill 返回 HTTP 404，`error_code=skill_not_found`；
+正文为空或读取失败返回 HTTP 503，`error_code=skill_unavailable`。
+错误响应包含 `request_id`，并设置 `X-Request-ID`。
+
+预算配置（均为正整数，非法环境变量回退默认值）：
+
+| 环境变量 | 默认值 | 范围 |
+| --- | --- | --- |
+| `COMMERCEMIND_SKILLS_CATALOG_MAX_CHARS` | 4000 | 目录块总字符上限，超出截断；完整目录可用 GET 查看 |
+| `COMMERCEMIND_SKILLS_BODY_MAX_CHARS` | 8192 | 每个选中正文的字符上限；截断会标记 |
+| `COMMERCEMIND_SKILLS_RESOURCE_MAX_CHARS` | 20480 | 加载器单资源读取上限，本次聊天不自动读取资源 |
+| `COMMERCEMIND_SKILLS_MAX_SELECTED_SKILLS` | 3 | 单次选择的不同 id 上限 |
+
+`skill_ids` 按请求顺序去重并去除两端空白；空 id、超过 64 字符的 id 或类型错误返回 422。
+不同 id 超过上限返回 422，`error_code=too_many_skills`。
+每次新的选技请求应使用新的 `client_request_id`：现有记忆回执仍按用户消息判断重试，
+相同消息与请求 id 会回放原答案，不会因 Skill 选择改变而重新调用模型。
+
+当前没有鉴权，只有同时设置 `COMMERCEMIND_SKILLS_ENABLED=true` 和
+`COMMERCEMIND_SKILLS_DEBUG=true` 才注册 `POST /skills/reload`，否则返回 404，
+OpenAPI 中也没有此路由。请仅在可信本地环境打开 debug。
+
+```bash
+curl -X POST http://localhost:8000/skills/reload
+```
+
+重载返回 `added/updated/removed/unchanged/errors/version/loaded_at/duration_ms/count`，
+不返回正文；重新扫描目录、原子替换快照并清空正文缓存，后续请求使用新目录及正文。
+重载只影响当前服务进程，多 worker 部署需逐进程重载或重启。
+
+验证：`python -m pytest -q tests/test_skill_api.py tests/test_skill_loader.py tests/test_skill_content.py`。

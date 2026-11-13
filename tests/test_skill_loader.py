@@ -890,3 +890,31 @@ def test_reload_uses_old_snapshot_until_swap(tmp_path, monkeypatch):
     ]
     assert reports[0].added == ("general_customer_service",)
     assert reports[0].version == 2
+
+
+def test_strict_metadata_reader_stops_before_body(tmp_path, monkeypatch):
+    import io
+    from pathlib import Path
+    header = "---\nname: 测试\ndescription: 处理测试问题\n---\n"
+    class HeaderOnly(io.StringIO):
+        def readline(self, size=-1):
+            if self.tell() >= len(header):
+                raise AssertionError("不允许读取正文")
+            return super().readline(size)
+    real_open = Path.open
+    def fake_open(path, *args, **kwargs):
+        if path.name == "SKILL.md":
+            return HeaderOnly(header + "BODY_MUST_NOT_BE_READ")
+        return real_open(path, *args, **kwargs)
+    write_skill(tmp_path, "test", front_matter="name: 测试\ndescription: 处理测试问题")
+    monkeypatch.setattr(Path, "open", fake_open)
+    manager = SkillManager(tmp_path, strict_front_matter=True)
+    assert len(manager.load()) == 1
+
+
+@pytest.mark.parametrize("front_matter", [None, "name: 名称", "description: 描述"])
+def test_strict_metadata_requires_front_matter_fields(tmp_path, front_matter):
+    write_skill(tmp_path, "test", front_matter=front_matter)
+    manager = SkillManager(tmp_path, strict_front_matter=True)
+    catalog = manager.load()
+    assert len(catalog) == 0 and len(catalog.errors) == 1
