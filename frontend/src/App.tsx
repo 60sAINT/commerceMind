@@ -12,6 +12,9 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
+import { isApiError } from '@/api'
+import { getHealth } from '@/services'
+
 import styles from './app.module.less'
 
 type Theme = 'light' | 'dark'
@@ -21,21 +24,7 @@ type Probe = {
   message: string
 }
 
-type HealthPayload = {
-  status?: string
-  model?: string
-  model_configured?: boolean
-  detail?: string | null
-}
-
-const stack = [
-  'Vite 8',
-  'React 19',
-  'TypeScript 5.9',
-  'Tailwind 4',
-  'Less',
-  'Zustand 5',
-]
+const stack = ['Vite 8', 'React 19', 'TypeScript 5.9', 'Tailwind 4', 'Less', 'Zustand 5']
 
 const tokens = [
   { name: 'canvas', value: '--cm-canvas' },
@@ -50,7 +39,7 @@ const tokens = [
 
 const milestones = [
   { label: 'P0 工程并入与设计基线', done: true },
-  { label: 'P1 类型与接口层', done: false },
+  { label: 'P1 类型与接口层', done: true },
   { label: 'P2 会话与状态', done: false },
   { label: 'P3 SSE 流式链路', done: false },
 ]
@@ -63,25 +52,21 @@ async function probeHealth(): Promise<Probe> {
   const started = performance.now()
 
   try {
-    const response = await fetch('/api/health', { headers: { Accept: 'application/json' } })
-    const payload = (await response.json().catch(() => null)) as HealthPayload | null
-
-    if (!response.ok) {
-      throw new Error(payload?.detail ?? `HTTP ${response.status}`)
-    }
-
-    const status = payload?.status ?? 'ok'
-    const model = payload?.model_configured === false ? '模型未配置' : payload?.model
+    const health = await getHealth()
+    const model = health.model_configured ? health.model : '模型未配置'
+    const memory = health.memory?.enabled
+      ? `memory ${health.memory.redis}/${health.memory.chroma}`
+      : null
     const elapsed = Math.round(performance.now() - started)
 
     return {
       kind: 'ok',
-      message: [status, model, `${elapsed} ms`].filter(Boolean).join(' · '),
+      message: [health.status, model, memory, `${elapsed} ms`].filter(Boolean).join(' · '),
     }
   } catch (error) {
     return {
       kind: 'error',
-      message: error instanceof Error ? error.message : '无法连接后端',
+      message: isApiError(error) ? error.message : '无法连接后端',
     }
   }
 }
@@ -150,7 +135,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <span className="inline-flex items-center gap-2 rounded-full border border-line bg-elevated px-3 py-1.5 text-[11px] text-muted shadow-soft">
               <span className="size-1.5 rounded-full bg-success" aria-hidden="true" />
-              P0 · 已就绪
+              P1 · 接口层
             </span>
             <button
               type="button"
@@ -231,7 +216,7 @@ export default function App() {
             <div className="mt-4 rounded-card border border-line bg-code px-3 py-2.5 font-mono text-[11px] leading-6 text-muted">
               <span className="text-success">GET</span> /api/health
               <br />
-              <span className="text-faint">→ proxy rewrite →</span> GET /health
+              <span className="text-faint">→ proxy rewrite →</span> getHealth()
             </div>
           </article>
 
@@ -288,13 +273,13 @@ export default function App() {
             </ul>
 
             <p className="mt-5 border-t border-line pt-4 text-[11px] leading-6 text-faint">
-              下一步：对齐后端 Pydantic 模型，封装 /chat、/skills 与错误码。
+              下一步：建立 sessionStore 与 chatStore，处理幂等、中断和竞态。
             </p>
           </article>
         </section>
 
         <footer className="mt-auto flex flex-wrap items-center justify-between gap-3 pt-12 text-[10px] text-faint">
-          <span className="font-mono">frontend/ · p0 · 2026-11-13</span>
+          <span className="font-mono">frontend/ · p1 · 2026-11-13</span>
           <span>Vite dev proxy · FastAPI same-origin in production</span>
         </footer>
       </main>
