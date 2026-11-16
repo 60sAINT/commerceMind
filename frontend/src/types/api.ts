@@ -104,3 +104,23 @@ export interface MemoryDebugResponse {
   turns: MemoryTurn[]
   ttl_s: MemoryTtl
 }
+
+export interface SessionSummary {
+  session_id: string
+  user_id: string
+  title: string
+  created_at: string
+  updated_at: string
+  message_count: number
+}
+
+export interface SessionMessage {
+  client_request_id: string | null
+  message_id: number
+  session_id: string
+  role: 'user' | 'assistant'
+  content: string
+  status: string
+  created_at: string
+  metadata: Record<string, unknown>
+}

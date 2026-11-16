@@ -12,7 +12,7 @@ export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api').replac
 export const DEFAULT_TIMEOUT_MS = 60_000
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST'
+  method?: 'GET' | 'POST' | 'DELETE'
   /** JSON 请求体，axios 会自动序列化并设置 Content-Type。 */
   body?: unknown
   /** URL 查询参数，值为 undefined / null 时由 axios 跳过。 */

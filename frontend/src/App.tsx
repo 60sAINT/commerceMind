@@ -5,6 +5,7 @@ import { MessageSquarePlus, Pencil, Moon, Send, Square, Sun, Trash2, Wifi } from
 import { getHealth } from '@/services'
 import { useChatStore, type ChatMessage } from '@/stores/chat'
 import { useSessionStore } from '@/stores/session'
+import { useHistoryStore } from '@/stores/history'
 
 const useConnectionStore = create<{ label: string; check: () => Promise<void> }>((set) => ({
   label: '连接中',
@@ -18,10 +19,6 @@ const useConnectionStore = create<{ label: string; check: () => Promise<void> }>
   },
 }))
 
-function newSessionId() {
-  return `session-${crypto.randomUUID()}`
-}
-
 /** 稳定引用，避免 messagesBySession 缺省时每次渲染都生成新数组。 */
 const EMPTY_MESSAGES: ChatMessage[] = []
 
@@ -33,13 +30,15 @@ export default function App() {
   const setUserId = useSessionStore((state) => state.setUserId)
   const setTheme = useSessionStore((state) => state.setTheme)
   const messagesBySession = useChatStore((state) => state.messagesBySession)
-  const messages = messagesBySession[sessionId] ?? EMPTY_MESSAGES
+  const history = useHistoryStore()
+  const historyReady = history.owner === userId && history.ready
+  const messages = historyReady ? (messagesBySession[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES
+  const sendingSessionId = useChatStore((state) => state.sendingSessionId)
   const sending = useChatStore((state) => state.sendingSessionId === sessionId)
   const send = useChatStore((state) => state.send)
   const stop = useChatStore((state) => state.stop)
   const retry = useChatStore((state) => state.retry)
   const editAndResend = useChatStore((state) => state.editAndResend)
-  const remove = useChatStore((state) => state.remove)
   const cancelForSessionSwitch = useChatStore((state) => state.cancelForSessionSwitch)
   const connection = useConnectionStore((state) => state.label)
   const checkConnection = useConnectionStore((state) => state.check)
@@ -58,6 +57,14 @@ export default function App() {
   }, [checkConnection])
 
   useEffect(() => {
+    if (sendingSessionId === null) void useHistoryStore.getState().loadSessions(userId)
+  }, [userId, sendingSessionId])
+
+  useEffect(() => {
+    if (historyReady) void useHistoryStore.getState().loadMessages(userId, sessionId)
+  }, [historyReady, userId, sessionId, sendingSessionId])
+
+  useEffect(() => {
     const abortActiveRequest = () => useChatStore.getState().stop()
     window.addEventListener('pagehide', abortActiveRequest)
     return () => window.removeEventListener('pagehide', abortActiveRequest)
@@ -68,34 +75,50 @@ export default function App() {
   }, [messages])
 
   function switchSession(id: string) {
+    if (id === sessionId) return
     cancelForSessionSwitch()
+    setEditingMessageId(null)
+    setDraft('')
     setSessionId(id)
   }
 
   function startNewSession() {
-    switchSession(newSessionId())
+    setEditingMessageId(null)
+    setDraft('')
+    void history.create(userId)
   }
 
   function deleteSession(id: string) {
-    remove(id)
-    if (id !== sessionId) return
-
-    // 删掉当前会话后切到最近一条历史；没有历史则回到空白新会话。
-    const remaining = Object.keys(useChatStore.getState().messagesBySession)
-    setSessionId(remaining.length > 0 ? remaining[remaining.length - 1] : '')
+    setEditingMessageId(null)
+    setDraft('')
+    void history.remove(userId, id)
   }
 
-  function submit(event: React.FormEvent) {
+  async function submit(event: React.FormEvent) {
     event.preventDefault()
-    if (!draft.trim() || sending) return
+    if (
+      !draft.trim() ||
+      sending ||
+      history.busy ||
+      history.loading ||
+      history.loadingMessages ||
+      !historyReady
+    )
+      return
+    let targetSessionId = sessionId
+    if (!targetSessionId) {
+      await history.create(userId)
+      targetSessionId = useSessionStore.getState().sessionId
+      if (!targetSessionId || useSessionStore.getState().userId !== userId) return
+    }
     const text = draft
     setDraft('')
     if (editingMessageId) {
-      void editAndResend(editingMessageId, text, sessionId, userId)
+      void editAndResend(editingMessageId, text, targetSessionId, userId)
       setEditingMessageId(null)
       return
     }
-    void send(text, sessionId, userId)
+    void send(text, targetSessionId, userId)
   }
 
   return (
@@ -110,6 +133,7 @@ export default function App() {
         <div className="p-3">
           <button
             onClick={startNewSession}
+            disabled={!historyReady || history.busy || history.loading}
             className="flex h-10 w-full items-center gap-2 rounded-md border border-line px-3 text-sm hover:bg-hover"
           >
             <MessageSquarePlus className="size-4" /> 新建会话
@@ -117,27 +141,18 @@ export default function App() {
         </div>
         <div className="px-5 pb-2 pt-3 text-[11px] font-medium text-faint">最近会话</div>
         <nav className="min-h-0 flex-1 overflow-y-auto px-2">
-          {Object.entries(messagesBySession).map(([id, history]) => (
+          {(historyReady ? history.sessions : []).map((session) => (
             <button
-              key={id}
-              onClick={() => switchSession(id)}
-              className={`mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-left text-xs ${id === sessionId ? 'bg-hover text-ink' : 'text-muted hover:bg-hover'}`}
+              key={session.session_id}
+              disabled={history.busy}
+              onClick={() => switchSession(session.session_id)}
+              className={`mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-left text-xs ${session.session_id === sessionId ? 'bg-hover text-ink' : 'text-muted hover:bg-hover'}`}
             >
               <span className="size-1.5 shrink-0 rounded-full bg-success" />
-              <span className="truncate">
-                {history.find((item) => item.role === 'user')?.content ?? '新会话'}
-              </span>
+              <span className="truncate">{session.title || '新会话'}</span>
             </button>
           ))}
-          {sessionId && !messagesBySession[sessionId] && (
-            <button
-              onClick={() => switchSession(sessionId)}
-              className="flex w-full items-center gap-2 rounded-md bg-hover px-3 py-2.5 text-left text-xs text-ink"
-            >
-              <span className="size-1.5 rounded-full bg-success" />
-              新会话
-            </button>
-          )}
+          {history.loading && <p className="p-3 text-xs text-muted">正在同步会话…</p>}
         </nav>
         <div className="border-t border-line p-4">
           <label className="mb-1.5 block text-[11px] text-faint" htmlFor="user-id">
@@ -146,7 +161,13 @@ export default function App() {
           <input
             id="user-id"
             value={userId}
-            onChange={(event) => setUserId(event.target.value)}
+            onChange={(event) => {
+              cancelForSessionSwitch()
+              setEditingMessageId(null)
+              setDraft('')
+              setSessionId('')
+              setUserId(event.target.value)
+            }}
             className="h-8 w-full rounded-md border border-line bg-canvas px-2 text-xs outline-none focus:border-line-strong"
           />
           <div className="mt-3 flex items-center gap-2 text-[11px] text-muted">
@@ -161,6 +182,7 @@ export default function App() {
           <div className="flex min-w-0 items-center gap-2">
             <button
               onClick={startNewSession}
+              disabled={!historyReady || history.busy || history.loading}
               title="新建会话"
               aria-label="新建会话"
               className="grid size-9 shrink-0 place-items-center rounded-md text-muted hover:bg-hover sm:hidden"
@@ -181,7 +203,7 @@ export default function App() {
               title="删除当前会话"
               aria-label="删除当前会话"
               onClick={() => deleteSession(sessionId)}
-              disabled={!sessionId}
+              disabled={!sessionId || !historyReady || history.busy}
               className="grid size-9 place-items-center rounded-md text-muted hover:bg-hover disabled:opacity-40"
             >
               <Trash2 className="size-4" />
@@ -199,6 +221,33 @@ export default function App() {
 
         <section className="flex-1 overflow-y-auto px-4 py-8 sm:px-8">
           <div className="mx-auto flex min-h-full max-w-3xl flex-col gap-6">
+            {history.error && (
+              <div role="alert" className="text-sm text-danger">
+                {history.error}
+                <button
+                  className="ml-3 underline"
+                  onClick={() => {
+                    void history.loadSessions(userId)
+                    if (historyReady) void history.loadMessages(userId, sessionId)
+                  }}
+                >
+                  重新加载
+                </button>
+              </div>
+            )}
+            {history.loadingMessages && (
+              <p role="status" className="text-xs text-muted">
+                正在加载消息…
+              </p>
+            )}
+            {historyReady && history.messageCursor !== null && !history.loadingMessages && (
+              <button
+                className="text-xs text-muted underline"
+                onClick={() => void history.loadMessages(userId, sessionId, true)}
+              >
+                加载更早消息
+              </button>
+            )}
             {messages.length === 0 ? (
               <div className="m-auto max-w-lg py-16 text-center">
                 <div className="mx-auto grid size-12 place-items-center rounded-lg border border-line bg-elevated">
@@ -319,7 +368,13 @@ export default function App() {
                 type="submit"
                 title={editingMessageId ? '编辑并重新发送' : '发送消息'}
                 aria-label={editingMessageId ? '编辑并重新发送' : '发送消息'}
-                disabled={!draft.trim()}
+                disabled={
+                  !draft.trim() ||
+                  !historyReady ||
+                  history.busy ||
+                  history.loading ||
+                  history.loadingMessages
+                }
                 className="grid size-10 shrink-0 place-items-center rounded-md bg-ink text-canvas disabled:opacity-35"
               >
                 <Send className="size-4" />

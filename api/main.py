@@ -34,6 +34,7 @@ from core.skill_loader import SkillBodyError, SkillManager, SkillNotFoundError
 from core.skill_selection import parse_skill_commands, select_skills
 from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
+from api.sessions import SessionRepository
 
 load_dotenv()
 
@@ -199,10 +200,15 @@ def create_app(
     settings = settings or Settings.from_env()
     llm = LLMClient(settings) if settings.model_configured else None
     started_memory: ConversationMemory | None = None
+    started_sessions: SessionRepository | None = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        nonlocal started_memory
+        nonlocal started_memory, started_sessions
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if database_url:
+            started_sessions = await SessionRepository.connect(database_url)
+            app.state.sessions = started_sessions
         # 注入的服务归调用方所有；只关闭自己启动的实例。
         if settings.memory.enabled and llm is not None and app.state.memory is None:
             try:
@@ -224,6 +230,8 @@ def create_app(
                     await started_memory.close()
                 except Exception:
                     logger.warning("关闭记忆服务失败", exc_info=True)
+            if started_sessions is not None:
+                await started_sessions.close()
 
     app = FastAPI(
         title="CommerceMind 智能客服",
@@ -235,6 +243,7 @@ def create_app(
     app.state.settings = settings
     app.state.llm = llm
     app.state.memory = memory
+    app.state.sessions = None
     app.state.skill_manager = None
     if settings.skills.enabled:
         manager = SkillManager(
@@ -255,6 +264,56 @@ def create_app(
                 "errors": [], "version": 0, "loaded_at": "",
             }
         return {"enabled": True, **manager.summary()}
+
+    @app.post("/sessions", tags=["会话"])
+    async def create_session(user_id: str = Query(min_length=1, max_length=128)):
+        repo: SessionRepository | None = app.state.sessions
+        if repo is None:
+            raise HTTPException(503, "会话数据库未配置")
+        return await repo.create_session(user_id)
+
+    @app.get("/sessions", tags=["会话"])
+    async def list_sessions(
+        user_id: str = Query(min_length=1, max_length=128),
+        limit: int = Query(default=30, ge=1, le=100),
+        before: str | None = None,
+    ):
+        repo: SessionRepository | None = app.state.sessions
+        if repo is None:
+            raise HTTPException(503, "会话数据库未配置")
+        try:
+            items = await repo.list_sessions(user_id, limit, before)
+        except ValueError:
+            raise HTTPException(422, "无效的会话分页游标")
+        cursor = f'{items[-1]["updated_at"].isoformat()}|{items[-1]["session_id"]}' if len(items) == limit else None
+        return {"items": items, "next_cursor": cursor}
+
+    @app.get("/sessions/{session_id}/messages", tags=["会话"])
+    async def list_session_messages(
+        session_id: str = Path(min_length=1, max_length=128),
+        user_id: str = Query(min_length=1, max_length=128),
+        limit: int = Query(default=50, ge=1, le=100),
+        before: int | None = Query(default=None, ge=1),
+    ):
+        repo: SessionRepository | None = app.state.sessions
+        if repo is None:
+            raise HTTPException(503, "会话数据库未配置")
+        if not await repo.owns_session(user_id, session_id):
+            raise HTTPException(404, "Session 不存在")
+        items = await repo.list_messages(user_id, session_id, limit, before)
+        return {"items": items, "next_cursor": items[0]["message_id"] if len(items) == limit else None}
+
+    @app.delete("/sessions/{session_id}", tags=["会话"])
+    async def delete_session(
+        session_id: str = Path(min_length=1, max_length=128),
+        user_id: str = Query(min_length=1, max_length=128),
+    ):
+        repo: SessionRepository | None = app.state.sessions
+        if repo is None:
+            raise HTTPException(503, "会话数据库未配置")
+        if not await repo.delete_session(user_id, session_id):
+            raise HTTPException(404, "Session 不存在")
+        return {"deleted": True}
 
     if settings.skills.enabled and settings.skills.debug:
         @app.post("/skills/reload", tags=["Skills"])
@@ -323,6 +382,7 @@ def create_app(
 
         request_id = uuid.uuid4().hex[:12]
         session_id = req.session_id or uuid.uuid4().hex[:16]
+        sessions: SessionRepository | None = request.app.state.sessions
         skill_system: str | None = None
         manager = request.app.state.skill_manager
         commands, message = parse_skill_commands(req.message) if manager is not None else ([], req.message)
@@ -342,6 +402,17 @@ def create_app(
             except (SkillBodyError, OSError, ValueError):
                 return _error_response(request_id, 503, "指定的 Skill 正文不可用", error_code="skill_unavailable")
         prompt = message if manager is not None else req.message
+        if sessions is not None and req.client_request_id:
+            receipt = await sessions.find_receipt(req.user_id, req.client_request_id)
+            if receipt is not None:
+                if receipt["user_message"] != req.message:
+                    return _error_response(request_id, 409, "同一 client_request_id 不能用于不同消息", error_code="client_request_id_conflict")
+                session_id = receipt["session_id"]
+                async def replay_events():
+                    yield _sse("meta", {"request_id": receipt["request_id"], "session_id": session_id})
+                    yield _sse("delta", {"text": receipt["assistant_message"]})
+                    yield _sse("done", {"request_id": receipt["request_id"], "session_id": session_id, "response": receipt["assistant_message"]})
+                return StreamingResponse(replay_events(), media_type="text/event-stream", headers=_sse_headers())
         if memory is not None and req.client_request_id:
             try:
                 session_id, replayed = await memory.resolve_session(
@@ -370,6 +441,7 @@ def create_app(
                     async for delta in llm.stream_chat(prompt, system=skill_system):
                         full_text.append(delta)
                         yield _sse("delta", {"text": delta})
+                    should_commit = True
                 else:
                     async with memory.conversation(req.user_id, session_id):
                         previous = await memory.get_receipt(req.user_id, session_id, req.client_request_id) if req.client_request_id else None
@@ -380,6 +452,7 @@ def create_app(
                             full_text.append(previous.assistant_message)
                             yield _sse("delta", {"text": previous.assistant_message})
                             active_request_id = previous.request_id
+                            should_commit = True
                         else:
                             try:
                                 context = await memory.read_context(req.user_id, session_id)
@@ -433,7 +506,23 @@ def create_app(
                 if not text:
                     yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
                     return
-                yield _sse("done", {"request_id": active_request_id, "session_id": session_id, "response": text})
+                if should_commit and sessions is not None:
+                    try:
+                        persisted = await sessions.commit_turn(
+                            req.user_id,
+                            session_id,
+                            req.client_request_id or request_id,
+                            active_request_id,
+                            req.message,
+                            text,
+                            state_for_commit,
+                        )
+                        text = persisted["response"]
+                        active_request_id = persisted["request_id"]
+                    except Exception:
+                        logger.exception("session_commit_failed request_id=%s", active_request_id)
+                        yield _sse("error", {"error_code": "session_commit_failed", "detail": "保存会话记录失败，请重试"})
+                        return
                 if should_commit and memory is not None:
                     try:
                         await memory.commit(
@@ -446,11 +535,10 @@ def create_app(
                             lock_held=True,
                             state=state_for_commit,
                         )
-                        committed = True
                     except Exception:
-                        # done represents completed generation; the caller may retry this ID
-                        # and regenerate because no successful receipt was stored.
-                        logger.exception("chat_stream_commit_failed request_id=%s", active_request_id)
+                        # PostgreSQL is the durable history/receipt; Redis memory is rebuildable.
+                        logger.exception("memory_commit_failed_after_session_commit request_id=%s", active_request_id)
+                yield _sse("done", {"request_id": active_request_id, "session_id": session_id, "response": text})
             except asyncio.CancelledError:
                 logger.info("chat_stream_cancelled request_id=%s committed=%s", active_request_id, committed)
                 raise

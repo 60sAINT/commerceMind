@@ -2,6 +2,7 @@
 #
 # 当前编排：
 #   - commercemind：FastAPI 应用
+#   - postgres：持久化 session、完整消息历史和幂等结果
 #   - redis：短期工作记忆、会话状态、摘要与幂等回执
 #   - chromadb：长期情景记忆与用户画像
 #
@@ -27,6 +28,10 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-commercemind123}@redis:6379/0
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-commercemind}:${POSTGRES_PASSWORD:-commercemind-local}@postgres:5432/${POSTGRES_DB:-commercemind}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
@@ -59,6 +64,25 @@ services:
       retries: 5
       start_period: 5s
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: commercemind-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-commercemind}
+      POSTGRES_USER: ${POSTGRES_USER:-commercemind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-commercemind-local}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   chromadb:
     # 与 requirements.txt 中的 Python 客户端保持同一版本，避免协议不兼容。
     image: chromadb/chroma:0.5.23
@@ -86,3 +110,4 @@ services:
 volumes:
   redis_data:
   chroma_data:
+  postgres_data:

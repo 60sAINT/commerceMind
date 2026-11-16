@@ -146,6 +146,7 @@ async function runRequest(
       payload,
       {
         onMeta: (meta) => {
+          if (useChatStore.getState().activeRequestId !== requestId || activeController !== controller) return
           if (!sessionId && meta.session_id) {
             moveSessionMessages(activeSessionId, meta.session_id)
             activeSessionId = meta.session_id
