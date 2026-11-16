@@ -3,24 +3,24 @@
 当前阶段包含以下链路：
 
     GET  /health  -> 检查服务、模型和记忆依赖（Redis/Chroma）
-    POST /chat    -> 读 working memory -> 调用 LLM -> 原子提交本轮
+    POST /chat/stream -> SSE：读 working memory / 意图识别 -> 流式生成 -> 原子提交本轮
     GET  /skills  -> Skill 轻量目录；POST /skills/reload 仅在 Skills debug 开启时注册
 
-不包含意图识别、Agent 路由、RAG、MCP 和监控；长期记忆检索暂未接入。
+不包含 Agent 路由、RAG、MCP 和监控；长期记忆检索暂未接入。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import os
-import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from core.config import Settings
@@ -29,7 +29,7 @@ from core.intent_embedding import IntentEmbeddingMatcher
 from core.intent_fusion import combine_intents
 from core.intent_llm import IntentLLMClassifier
 from core.intent_pattern import recognize_pattern
-from core.llm import SYSTEM_PROMPT, ChatResult, LLMClient, LLMError
+from core.llm import SYSTEM_PROMPT, LLMClient, LLMError
 from core.skill_loader import SkillBodyError, SkillManager, SkillNotFoundError
 from core.skill_selection import parse_skill_commands, select_skills
 from memory.locks import LeaseLostError, LockBusyError
@@ -82,15 +82,6 @@ class ChatRequest(BaseModel):
         return value
 
 
-class ChatResponse(BaseModel):
-    request_id: str
-    session_id: str
-    response: str
-    latency_ms: float
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-
-
 class MemoryTurnDebug(BaseModel):
     turn_id: str
     request_id: str
@@ -118,10 +109,6 @@ class MemoryDebugResponse(BaseModel):
     ttl_s: MemoryTTLDebug
 
 
-class _ReceiptConflict(Exception):
-    """同一 client_request_id 被用于不同消息。"""
-
-
 def _error_response(
     request_id: str,
     status_code: int,
@@ -141,15 +128,16 @@ def _error_response(
     )
 
 
-def _result_text(result: ChatResult | str) -> str:
-    """兼容旧测试替身返回纯字符串。"""
-    return result if isinstance(result, str) else result.text
+def _sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _result_usage(result: ChatResult | str) -> tuple[int | None, int | None]:
-    if isinstance(result, ChatResult):
-        return result.input_tokens, result.output_tokens
-    return None, None
+def _sse_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
 
 
 async def _recognize_intent(message: str, llm: LLMClient, settings, *, history=None):
@@ -325,365 +313,159 @@ def create_app(
             detail="；".join(problems) or None,
         )
 
-    @app.post("/chat", response_model=ChatResponse, tags=["对话"])
-    async def chat(
-        req: ChatRequest, request: Request, response: Response,
-    ) -> ChatResponse | JSONResponse:
-        """读记忆、调用模型、提交本轮；失败轮次不写入。"""
-        request_id = uuid.uuid4().hex[:12]
-        started = time.perf_counter()
+    @app.post("/chat/stream", tags=["对话"])
+    async def chat_stream(req: ChatRequest, request: Request):
+        """SSE chat: only persist the complete turn after generation finishes."""
         memory: ConversationMemory | None = request.app.state.memory
-        session_id = req.session_id or uuid.uuid4().hex[:16]
-        replayed = None
+        llm: LLMClient | None = request.app.state.llm
+        if llm is None:
+            return _error_response("", 503, "模型未配置", error_code="model_not_configured")
 
+        request_id = uuid.uuid4().hex[:12]
+        session_id = req.session_id or uuid.uuid4().hex[:16]
         skill_system: str | None = None
         manager = request.app.state.skill_manager
+        commands, message = parse_skill_commands(req.message) if manager is not None else ([], req.message)
+        if commands and not message:
+            return _error_response(request_id, 422, "选择 Skill 后请输入问题", error_code="skill_message_required")
+        selected = list(dict.fromkeys([*(req.skill_ids or []), *commands]))
+        manual_selection = req.skill_ids is not None or bool(commands)
         if manager is not None:
-            commands, message = parse_skill_commands(req.message)
-            if commands and not message:
-                return _error_response(
-                    request_id, 422, "选择 Skill 后请输入问题",
-                    error_code="skill_message_required",
-                )
-            selected = list(dict.fromkeys([*(req.skill_ids or []), *commands]))
-            manual_selection = req.skill_ids is not None or bool(commands)
             if len(selected) > settings.skills.max_selected_skills:
-                return _error_response(
-                    request_id, 422, "选择的 Skill 数量超过限制",
-                    error_code="too_many_skills",
-                )
+                return _error_response(request_id, 422, "选择的 Skill 数量超过限制", error_code="too_many_skills")
             try:
-                skill_system = await asyncio.to_thread(
-                    _skill_system_prompt, manager, selected, settings.skills.catalog_max_chars,
-                )
+                if not manual_selection:
+                    selected = await select_skills(req.message, manager.catalog, llm, max_selected=settings.skills.max_selected_skills, max_chars=settings.skills.catalog_max_chars)
+                skill_system = await asyncio.to_thread(_skill_system_prompt, manager, selected, settings.skills.catalog_max_chars)
             except SkillNotFoundError:
-                return _error_response(
-                    request_id, 404, "指定的 Skill 不存在或已不可用",
-                    error_code="skill_not_found",
-                )
+                return _error_response(request_id, 404, "指定的 Skill 不存在或已不可用", error_code="skill_not_found")
             except (SkillBodyError, OSError, ValueError):
-                return _error_response(
-                    request_id, 503, "指定的 Skill 正文不可用，请重载目录或检查文件",
-                    error_code="skill_unavailable",
-                )
-
-        # 先按 client_request_id 回到原会话：重试不带 session_id 也能回放。
+                return _error_response(request_id, 503, "指定的 Skill 正文不可用", error_code="skill_unavailable")
+        prompt = message if manager is not None else req.message
         if memory is not None and req.client_request_id:
             try:
                 session_id, replayed = await memory.resolve_session(
                     req.user_id, req.session_id, req.client_request_id,
                 )
+                if replayed is not None:
+                    if replayed.user_message != req.message:
+                        return _error_response(request_id, 409, "同一 client_request_id 不能用于不同消息", error_code="client_request_id_conflict")
+                    async def replay_events():
+                        yield _sse("meta", {"request_id": replayed.request_id, "session_id": session_id})
+                        yield _sse("delta", {"text": replayed.assistant_message})
+                        yield _sse("done", {"request_id": replayed.request_id, "session_id": session_id, "response": replayed.assistant_message})
+                    return StreamingResponse(replay_events(), media_type="text/event-stream", headers=_sse_headers())
             except Exception:
-                logger.warning(
-                    "memory_receipt_lookup_failed request_id=%s error_type=%s",
-                    request_id,
-                    "redis",
-                    exc_info=True,
-                )
-                replayed = None
+                logger.warning("stream_receipt_lookup_failed", exc_info=True)
 
-        # 只记录长度和标识，不记录用户原文，避免隐私进入日志。
-        logger.info(
-            "chat_start request_id=%s session_id=%s memory=%s message_chars=%d",
-            request_id,
-            session_id,
-            memory is not None,
-            len(req.message),
-        )
-
-        if replayed is not None:
-            if replayed.user_message != req.message:
-                latency_ms = (time.perf_counter() - started) * 1000
-                logger.warning(
-                    "chat_error request_id=%s status=409 "
-                    "error_code=client_request_id_conflict latency_ms=%.1f",
-                    request_id,
-                    latency_ms,
-                )
-                return _error_response(
-                    request_id,
-                    409,
-                    "同一 client_request_id 不能用于不同消息",
-                    error_code="client_request_id_conflict",
-                )
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.info(
-                "chat_replay request_id=%s session_id=%s latency_ms=%.1f",
-                replayed.request_id,
-                session_id,
-                latency_ms,
-            )
-            response.headers["X-Request-ID"] = replayed.request_id
-            return ChatResponse(
-                request_id=replayed.request_id,
-                session_id=session_id,
-                response=replayed.assistant_message,
-                latency_ms=round(latency_ms, 1),
-            )
-
-        llm: LLMClient | None = request.app.state.llm
-        if llm is None:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "chat_error request_id=%s status=503 error_code=model_not_configured "
-                "error_type=none latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                503,
-                "模型未配置：请先在 .env 中设置 ANTHROPIC_API_KEY",
-                error_code="model_not_configured",
-            )
-
-        async def run_with_memory() -> ChatResponse:
-            async with memory.conversation(req.user_id, session_id):
-                previous = await memory.get_receipt(
-                    req.user_id, session_id, req.client_request_id,
-                )
-                if previous is not None:
-                    if previous.user_message != req.message:
-                        raise _ReceiptConflict
-                    latency_ms = (time.perf_counter() - started) * 1000
-                    logger.info(
-                        "chat_replay request_id=%s session_id=%s latency_ms=%.1f",
-                        previous.request_id,
-                        session_id,
-                        latency_ms,
-                    )
-                    return ChatResponse(
-                        request_id=previous.request_id,
-                        session_id=session_id,
-                        response=previous.assistant_message,
-                        latency_ms=round(latency_ms, 1),
-                    )
-
-                try:
-                    context = await memory.read_context(req.user_id, session_id)
-                except Exception:
-                    # 读记忆失败按无历史继续，不能因为 Redis 故障拒绝本轮对话。
-                    logger.warning(
-                        "memory_read_failed request_id=%s session_id=%s",
-                        request_id,
-                        session_id,
-                        exc_info=True,
-                    )
-                    context = None
-
-                if context is None:
-                    try:
-                        state = await memory.store.get_state(req.user_id, session_id)
-                    except Exception:
-                        state = None
-                    history = None
+        async def events():
+            full_text: list[str] = []
+            committed = False
+            should_commit = False
+            state_for_commit: dict[str, Any] | None = None
+            active_request_id = request_id
+            try:
+                yield _sse("meta", {"request_id": request_id, "session_id": session_id})
+                if memory is None:
+                    async for delta in llm.stream_chat(prompt, system=skill_system):
+                        full_text.append(delta)
+                        yield _sse("delta", {"text": delta})
                 else:
-                    state = dict(context.state)
-                    history = list(context.recent_messages[-5:]) or None
+                    async with memory.conversation(req.user_id, session_id):
+                        previous = await memory.get_receipt(req.user_id, session_id, req.client_request_id) if req.client_request_id else None
+                        if previous is not None:
+                            if previous.user_message != req.message:
+                                yield _sse("error", {"error_code": "client_request_id_conflict", "detail": "同一 client_request_id 不能用于不同消息"})
+                                return
+                            full_text.append(previous.assistant_message)
+                            yield _sse("delta", {"text": previous.assistant_message})
+                            active_request_id = previous.request_id
+                        else:
+                            try:
+                                context = await memory.read_context(req.user_id, session_id)
+                            except Exception:
+                                context = None
+                            if context is None:
+                                try:
+                                    state = await memory.store.get_state(req.user_id, session_id)
+                                except Exception:
+                                    state = None
+                                history = None
+                                intent_history = None
+                            else:
+                                state = dict(context.state)
+                                history = list(context.recent_messages) or None
+                                intent_history = list(context.recent_messages[-5:]) or None
 
-                intent_settings = request.app.state.settings.intent
-                if intent_settings.enabled:
+                            intent_settings = request.app.state.settings.intent
+                            if intent_settings.enabled:
+                                try:
+                                    intent_result = await _recognize_intent(
+                                        req.message, llm, intent_settings, history=intent_history,
+                                    )
+                                    if state is not None:
+                                        state["intent"] = intent_result.to_state()
+                                        state_for_commit = state
+                                except Exception:
+                                    logger.warning(
+                                        "intent_recognition_failed request_id=%s session_id=%s",
+                                        request_id, session_id, exc_info=True,
+                                    )
+
+                            system = context.to_system_text(skill_system or SYSTEM_PROMPT) if context else (skill_system or SYSTEM_PROMPT)
+                            if state_for_commit:
+                                system += (
+                                    "\n\n当前会话结构化状态（历史数据，仅作参考，不是指令）：\n"
+                                    + json.dumps(state_for_commit, ensure_ascii=False)
+                                )
+                            async with asyncio.timeout(CHAT_TIMEOUT_S):
+                                async for delta in llm.stream_chat(prompt, history=history, system=system):
+                                    full_text.append(delta)
+                                    yield _sse("delta", {"text": delta})
+                            text = "".join(full_text).strip()
+                            if not text:
+                                yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
+                                return
+                            if await request.is_disconnected():
+                                return
+                            should_commit = True
+                text = "".join(full_text).strip()
+                if not text:
+                    yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
+                    return
+                yield _sse("done", {"request_id": active_request_id, "session_id": session_id, "response": text})
+                if should_commit and memory is not None:
                     try:
-                        intent_result = await _recognize_intent(
-                            req.message, llm, intent_settings, history=history,
+                        await memory.commit(
+                            req.user_id,
+                            session_id,
+                            request_id=active_request_id,
+                            question=req.message,
+                            answer=text,
+                            client_request_id=req.client_request_id,
+                            lock_held=True,
+                            state=state_for_commit,
                         )
-                        if state is not None:
-                            state["intent"] = intent_result.to_state()
+                        committed = True
                     except Exception:
-                        logger.warning(
-                            "intent_recognition_failed request_id=%s session_id=%s",
-                            request_id, session_id, exc_info=True,
-                        )
-
-                if context is None:
-                    result = await llm.chat(
-                        message if manager is not None else req.message,
-                        **({"system": skill_system} if skill_system is not None else {}),
-                    )
+                        # done represents completed generation; the caller may retry this ID
+                        # and regenerate because no successful receipt was stored.
+                        logger.exception("chat_stream_commit_failed request_id=%s", active_request_id)
+            except asyncio.CancelledError:
+                logger.info("chat_stream_cancelled request_id=%s committed=%s", active_request_id, committed)
+                raise
+            except Exception as exc:
+                if isinstance(exc, LockBusyError):
+                    yield _sse("error", {"error_code": "conversation_busy", "detail": str(exc)})
+                elif isinstance(exc, LeaseLostError):
+                    yield _sse("error", {"error_code": "conversation_lease_lost", "detail": str(exc)})
+                elif isinstance(exc, LLMError):
+                    yield _sse("error", {"error_code": exc.code, "detail": str(exc)})
                 else:
-                    result = await llm.chat(
-                        message if manager is not None else req.message,
-                        history=list(context.recent_messages),
-                        system=context.to_system_text(
-                            skill_system if skill_system is not None else SYSTEM_PROMPT,
-                        ),
-                    )
-                text = _result_text(result)
-                input_tokens, output_tokens = _result_usage(result)
+                    logger.exception("chat_stream_failed request_id=%s", active_request_id)
+                    yield _sse("error", {"error_code": "internal_error", "detail": "服务内部错误，请稍后重试"})
 
-                try:
-                    # 已在会话锁内，避免 commit_turn 再次加锁自锁。
-                    await memory.commit(
-                        req.user_id,
-                        session_id,
-                        request_id=request_id,
-                        question=req.message,
-                        answer=text,
-                        client_request_id=req.client_request_id,
-                        lock_held=True,
-                        state=state if intent_settings.enabled and state is not None else None,
-                    )
-                except Exception:
-                    # 答案已经生成，写入失败只降级记忆，不把本轮回答丢掉。
-                    logger.warning(
-                        "memory_commit_failed request_id=%s session_id=%s",
-                        request_id,
-                        session_id,
-                        exc_info=True,
-                    )
-
-                latency_ms = (time.perf_counter() - started) * 1000
-                return ChatResponse(
-                    request_id=request_id,
-                    session_id=session_id,
-                    response=text,
-                    latency_ms=round(latency_ms, 1),
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-
-        try:
-            if manager is not None and not manual_selection:
-                selected = await select_skills(
-                    req.message, manager.catalog, llm,
-                    max_selected=settings.skills.max_selected_skills,
-                    max_chars=settings.skills.catalog_max_chars,
-                )
-                try:
-                    skill_system = await asyncio.to_thread(
-                        _skill_system_prompt, manager, selected, settings.skills.catalog_max_chars,
-                    )
-                except SkillNotFoundError:
-                    return _error_response(
-                        request_id, 404, "指定的 Skill 不存在或已不可用",
-                        error_code="skill_not_found",
-                    )
-                except (SkillBodyError, OSError, ValueError):
-                    return _error_response(
-                        request_id, 503, "指定的 Skill 正文不可用，请重载目录或检查文件",
-                        error_code="skill_unavailable",
-                    )
-            if memory is None:
-                result = await llm.chat(
-                    message if manager is not None else req.message,
-                    **({"system": skill_system} if skill_system is not None else {}),
-                )
-                text = _result_text(result)
-                input_tokens, output_tokens = _result_usage(result)
-                latency_ms = (time.perf_counter() - started) * 1000
-                chat_response = ChatResponse(
-                    request_id=request_id,
-                    session_id=session_id,
-                    response=text,
-                    latency_ms=round(latency_ms, 1),
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-            else:
-                async with asyncio.timeout(CHAT_TIMEOUT_S):
-                    chat_response = await run_with_memory()
-        except TimeoutError:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "chat_error request_id=%s status=504 error_code=request_timeout "
-                "error_type=timeout latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                504,
-                "本轮处理超时，请稍后重试",
-                error_code="request_timeout",
-            )
-        except _ReceiptConflict:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "chat_error request_id=%s status=409 error_code=client_request_id_conflict "
-                "latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                409,
-                "同一 client_request_id 不能用于不同消息",
-                error_code="client_request_id_conflict",
-            )
-        except LockBusyError as ex:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "chat_error request_id=%s status=409 error_code=conversation_busy "
-                "latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "detail": str(ex),
-                    "request_id": request_id,
-                    "error_code": "conversation_busy",
-                },
-                headers={"X-Request-ID": request_id, "Retry-After": "1"},
-            )
-        except LeaseLostError as ex:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "chat_error request_id=%s status=503 error_code=conversation_lease_lost "
-                "latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                503,
-                str(ex),
-                error_code="conversation_lease_lost",
-            )
-        except LLMError as ex:
-            latency_ms = (time.perf_counter() - started) * 1000
-            cause_type = type(ex.__cause__).__name__ if ex.__cause__ else "none"
-            logger.warning(
-                "chat_error request_id=%s status=%d error_code=%s error_type=%s latency_ms=%.1f",
-                request_id,
-                ex.status_code,
-                ex.code,
-                cause_type,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                ex.status_code,
-                str(ex),
-                error_code=ex.code,
-            )
-        except Exception:
-            latency_ms = (time.perf_counter() - started) * 1000
-            logger.exception(
-                "chat_unexpected request_id=%s latency_ms=%.1f",
-                request_id,
-                latency_ms,
-            )
-            return _error_response(
-                request_id,
-                500,
-                "服务内部错误，请稍后重试",
-                error_code="internal_error",
-            )
-
-        logger.info(
-            "chat_done request_id=%s session_id=%s status=200 latency_ms=%.1f "
-            "response_chars=%d input_tokens=%s output_tokens=%s",
-            chat_response.request_id,
-            session_id,
-            chat_response.latency_ms,
-            len(chat_response.response),
-            chat_response.input_tokens,
-            chat_response.output_tokens,
-        )
-        response.headers["X-Request-ID"] = chat_response.request_id
-        return chat_response
+        return StreamingResponse(events(), media_type="text/event-stream", headers=_sse_headers())
 
     # 关闭时不注册路由，避免只在处理函数里判断而暴露接口存在。
     if settings.memory.debug:

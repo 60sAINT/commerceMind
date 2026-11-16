@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 
 import anthropic
 import httpx
@@ -37,6 +38,15 @@ class FakeLLM:
         if self.error is not None:
             raise self.error
         return ChatResult(self.text)
+
+    async def stream_chat(self, message: str, *, history=None, system=None):
+        self.last_message = message
+        self.calls += 1
+        split = max(1, len(self.text) // 2)
+        for chunk in (self.text[:split], self.text[split:]):
+            await asyncio.sleep(0)
+            if chunk:
+                yield chunk
 
 
 def make_app(*, api_key: str = "test-key") -> object:
@@ -105,6 +115,24 @@ async def test_chat_returns_model_text_and_latency():
     assert body["request_id"]
     assert response.headers["x-request-id"] == body["request_id"]
     assert fake.last_message == "退款一般多久到账？"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_emits_sse_events_without_changing_legacy_chat():
+    app = make_app()
+    fake = FakeLLM("流式回答")
+    app.state.llm = fake
+    app.state.memory = None
+
+    response = await send(app, "POST", "/chat/stream", json={"message": "问题"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: meta" in response.text
+    assert 'event: delta\ndata: {"text": "流式"}' in response.text
+    assert 'event: delta\ndata: {"text": "回答"}' in response.text
+    assert 'event: done' in response.text
+    assert fake.calls == 1
 
 
 @pytest.mark.asyncio

@@ -1,287 +1,335 @@
-import { clsx } from 'clsx'
-import {
-  Check,
-  LoaderCircle,
-  Moon,
-  Palette,
-  PlugZap,
-  RefreshCw,
-  Server,
-  Sun,
-  Waypoints,
-} from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { create } from 'zustand'
+import { MessageSquarePlus, Pencil, Moon, Send, Square, Sun, Trash2, Wifi } from 'lucide-react'
 
-import { isApiError } from '@/api'
 import { getHealth } from '@/services'
+import { useChatStore, type ChatMessage } from '@/stores/chat'
+import { useSessionStore } from '@/stores/session'
 
-import styles from './app.module.less'
-
-type Theme = 'light' | 'dark'
-
-type Probe = {
-  kind: 'loading' | 'ok' | 'error'
-  message: string
-}
-
-const stack = ['Vite 8', 'React 19', 'TypeScript 5.9', 'Tailwind 4', 'Less', 'Zustand 5']
-
-const tokens = [
-  { name: 'canvas', value: '--cm-canvas' },
-  { name: 'sidebar', value: '--cm-sidebar' },
-  { name: 'soft', value: '--cm-soft' },
-  { name: 'ink', value: '--cm-ink' },
-  { name: 'muted', value: '--cm-muted' },
-  { name: 'line', value: '--cm-line' },
-  { name: 'success', value: '--cm-success' },
-  { name: 'danger', value: '--cm-danger' },
-]
-
-const milestones = [
-  { label: 'P0 工程并入与设计基线', done: true },
-  { label: 'P1 类型与接口层', done: true },
-  { label: 'P2 会话与状态', done: false },
-  { label: 'P3 SSE 流式链路', done: false },
-]
-
-function readTheme(): Theme {
-  return document.documentElement.classList.contains('dark') ? 'dark' : 'light'
-}
-
-async function probeHealth(): Promise<Probe> {
-  const started = performance.now()
-
-  try {
-    const health = await getHealth()
-    const model = health.model_configured ? health.model : '模型未配置'
-    const memory = health.memory?.enabled
-      ? `memory ${health.memory.redis}/${health.memory.chroma}`
-      : null
-    const elapsed = Math.round(performance.now() - started)
-
-    return {
-      kind: 'ok',
-      message: [health.status, model, memory, `${elapsed} ms`].filter(Boolean).join(' · '),
+const useConnectionStore = create<{ label: string; check: () => Promise<void> }>((set) => ({
+  label: '连接中',
+  check: async () => {
+    try {
+      const health = await getHealth({ timeoutMs: 8000 })
+      set({ label: health.status === 'ok' ? '在线' : '服务降级' })
+    } catch {
+      set({ label: '离线' })
     }
-  } catch (error) {
-    return {
-      kind: 'error',
-      message: isApiError(error) ? error.message : '无法连接后端',
-    }
-  }
+  },
+}))
+
+function newSessionId() {
+  return `session-${crypto.randomUUID()}`
 }
+
+/** 稳定引用，避免 messagesBySession 缺省时每次渲染都生成新数组。 */
+const EMPTY_MESSAGES: ChatMessage[] = []
 
 export default function App() {
-  const [theme, setTheme] = useState<Theme>(readTheme)
-  const [probe, setProbe] = useState<Probe>({
-    kind: 'loading',
-    message: '正在通过 /api 检查后端…',
-  })
+  const userId = useSessionStore((state) => state.userId)
+  const sessionId = useSessionStore((state) => state.sessionId)
+  const theme = useSessionStore((state) => state.theme)
+  const setSessionId = useSessionStore((state) => state.setSessionId)
+  const setUserId = useSessionStore((state) => state.setUserId)
+  const setTheme = useSessionStore((state) => state.setTheme)
+  const messagesBySession = useChatStore((state) => state.messagesBySession)
+  const messages = messagesBySession[sessionId] ?? EMPTY_MESSAGES
+  const sending = useChatStore((state) => state.sendingSessionId === sessionId)
+  const send = useChatStore((state) => state.send)
+  const stop = useChatStore((state) => state.stop)
+  const retry = useChatStore((state) => state.retry)
+  const editAndResend = useChatStore((state) => state.editAndResend)
+  const remove = useChatStore((state) => state.remove)
+  const cancelForSessionSwitch = useChatStore((state) => state.cancelForSessionSwitch)
+  const connection = useConnectionStore((state) => state.label)
+  const checkConnection = useConnectionStore((state) => state.check)
+  const [draft, setDraft] = useState('')
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const endRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    let cancelled = false
+    document.documentElement.classList.toggle('dark', theme === 'dark')
+    document.documentElement.style.colorScheme = theme
+    localStorage.setItem('commercemind.theme', theme)
+  }, [theme])
 
-    void probeHealth().then((result) => {
-      if (!cancelled) {
-        setProbe(result)
-      }
-    })
+  useEffect(() => {
+    void checkConnection()
+  }, [checkConnection])
 
-    return () => {
-      cancelled = true
-    }
+  useEffect(() => {
+    const abortActiveRequest = () => useChatStore.getState().stop()
+    window.addEventListener('pagehide', abortActiveRequest)
+    return () => window.removeEventListener('pagehide', abortActiveRequest)
   }, [])
 
-  function toggleTheme() {
-    const next: Theme = theme === 'dark' ? 'light' : 'dark'
-    setTheme(next)
-    document.documentElement.classList.toggle('dark', next === 'dark')
-    document.documentElement.style.colorScheme = next
-    localStorage.setItem('commercemind.theme', next)
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [messages])
+
+  function switchSession(id: string) {
+    cancelForSessionSwitch()
+    setSessionId(id)
   }
 
-  async function rerunProbe() {
-    setProbe({ kind: 'loading', message: '正在检查…' })
-    setProbe(await probeHealth())
+  function startNewSession() {
+    switchSession(newSessionId())
   }
 
-  const statusDot = clsx(
-    'size-1.5 rounded-full',
-    probe.kind === 'ok' && 'bg-success',
-    probe.kind === 'error' && 'bg-danger',
-    probe.kind === 'loading' && 'cm-breathe bg-faint',
-  )
+  function deleteSession(id: string) {
+    remove(id)
+    if (id !== sessionId) return
+
+    // 删掉当前会话后切到最近一条历史；没有历史则回到空白新会话。
+    const remaining = Object.keys(useChatStore.getState().messagesBySession)
+    setSessionId(remaining.length > 0 ? remaining[remaining.length - 1] : '')
+  }
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault()
+    if (!draft.trim() || sending) return
+    const text = draft
+    setDraft('')
+    if (editingMessageId) {
+      void editAndResend(editingMessageId, text, sessionId, userId)
+      setEditingMessageId(null)
+      return
+    }
+    void send(text, sessionId, userId)
+  }
 
   return (
-    <div className="relative min-h-dvh bg-canvas text-ink">
-      <div className={styles.backdrop} aria-hidden="true" />
+    <div className="flex h-dvh bg-canvas text-ink">
+      <aside className="flex w-64 shrink-0 flex-col border-r border-line bg-sidebar max-sm:hidden">
+        <div className="flex h-16 items-center gap-3 border-b border-line px-5">
+          <div className="grid size-8 place-items-center rounded-md bg-ink text-sm font-bold text-canvas">
+            C
+          </div>
+          <span className="font-semibold">CommerceMind</span>
+        </div>
+        <div className="p-3">
+          <button
+            onClick={startNewSession}
+            className="flex h-10 w-full items-center gap-2 rounded-md border border-line px-3 text-sm hover:bg-hover"
+          >
+            <MessageSquarePlus className="size-4" /> 新建会话
+          </button>
+        </div>
+        <div className="px-5 pb-2 pt-3 text-[11px] font-medium text-faint">最近会话</div>
+        <nav className="min-h-0 flex-1 overflow-y-auto px-2">
+          {Object.entries(messagesBySession).map(([id, history]) => (
+            <button
+              key={id}
+              onClick={() => switchSession(id)}
+              className={`mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-left text-xs ${id === sessionId ? 'bg-hover text-ink' : 'text-muted hover:bg-hover'}`}
+            >
+              <span className="size-1.5 shrink-0 rounded-full bg-success" />
+              <span className="truncate">
+                {history.find((item) => item.role === 'user')?.content ?? '新会话'}
+              </span>
+            </button>
+          ))}
+          {sessionId && !messagesBySession[sessionId] && (
+            <button
+              onClick={() => switchSession(sessionId)}
+              className="flex w-full items-center gap-2 rounded-md bg-hover px-3 py-2.5 text-left text-xs text-ink"
+            >
+              <span className="size-1.5 rounded-full bg-success" />
+              新会话
+            </button>
+          )}
+        </nav>
+        <div className="border-t border-line p-4">
+          <label className="mb-1.5 block text-[11px] text-faint" htmlFor="user-id">
+            用户 ID
+          </label>
+          <input
+            id="user-id"
+            value={userId}
+            onChange={(event) => setUserId(event.target.value)}
+            className="h-8 w-full rounded-md border border-line bg-canvas px-2 text-xs outline-none focus:border-line-strong"
+          />
+          <div className="mt-3 flex items-center gap-2 text-[11px] text-muted">
+            <Wifi className="size-3.5" />
+            后端{connection}
+          </div>
+        </div>
+      </aside>
 
-      <main className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-6 py-12 sm:px-8 sm:py-16">
-        <header className="cm-fade-up flex flex-wrap items-start justify-between gap-6">
-          <div className="flex items-center gap-4">
-            <span className={styles.brandMark} aria-hidden="true">
-              C
-            </span>
-            <div>
-              <p className="text-[10px] font-medium uppercase tracking-[0.2em] text-faint">
-                CommerceMind
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight sm:text-[28px]">
-                前端工程基线
+      <main className="flex min-w-0 flex-1 flex-col">
+        <header className="flex h-16 shrink-0 items-center justify-between border-b border-line px-5 sm:px-8">
+          <div className="flex min-w-0 items-center gap-2">
+            <button
+              onClick={startNewSession}
+              title="新建会话"
+              aria-label="新建会话"
+              className="grid size-9 shrink-0 place-items-center rounded-md text-muted hover:bg-hover sm:hidden"
+            >
+              <MessageSquarePlus className="size-4" />
+            </button>
+            <div className="min-w-0">
+              <h1 className="truncate text-sm font-semibold">
+                {messages.find((item) => item.role === 'user')?.content ?? '新会话'}
               </h1>
+              <p className="mt-0.5 text-[11px] text-faint">
+                {sessionId ? `会话 ${sessionId.slice(0, 18)}` : '尚未发送消息'}
+              </p>
             </div>
           </div>
-
-          <div className="flex items-center gap-3">
-            <span className="inline-flex items-center gap-2 rounded-full border border-line bg-elevated px-3 py-1.5 text-[11px] text-muted shadow-soft">
-              <span className="size-1.5 rounded-full bg-success" aria-hidden="true" />
-              P1 · 接口层
-            </span>
+          <div className="flex items-center gap-2">
             <button
-              type="button"
-              onClick={toggleTheme}
-              className="inline-flex items-center gap-2 rounded-full border border-line bg-elevated px-3.5 py-2 text-xs font-medium text-ink shadow-soft transition-colors hover:bg-hover"
-              aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+              title="删除当前会话"
+              aria-label="删除当前会话"
+              onClick={() => deleteSession(sessionId)}
+              disabled={!sessionId}
+              className="grid size-9 place-items-center rounded-md text-muted hover:bg-hover disabled:opacity-40"
             >
-              {theme === 'dark' ? (
-                <Sun className="size-4" aria-hidden="true" />
-              ) : (
-                <Moon className="size-4" aria-hidden="true" />
-              )}
-              {theme === 'dark' ? '浅色' : '深色'}
+              <Trash2 className="size-4" />
+            </button>
+            <button
+              title={theme === 'dark' ? '浅色主题' : '深色主题'}
+              aria-label={theme === 'dark' ? '切换浅色主题' : '切换深色主题'}
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="grid size-9 place-items-center rounded-md text-muted hover:bg-hover"
+            >
+              {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
           </div>
         </header>
 
-        <section className="cm-fade-up mt-10 grid gap-4 lg:grid-cols-3">
-          <article className="rounded-panel border border-line bg-elevated p-6 shadow-soft lg:col-span-2">
-            <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.14em] text-faint">
-              <Waypoints className="size-3.5" aria-hidden="true" />
-              工程链路
-            </div>
-
-            <h2 className="mt-4 text-lg font-semibold tracking-tight">
-              前后端同仓，开发期统一走代理
-            </h2>
-            <p className="mt-2 max-w-xl text-sm leading-7 text-muted">
-              Vite 负责开发与构建，Tailwind 负责布局与状态，Less 只承载设计令牌、动画和复杂选择器。
-              浏览器请求统一带上 <code className="font-mono text-[12px] text-ink">/api</code>{' '}
-              前缀，由开发服务器转发到 FastAPI，生产环境保持同源。
-            </p>
-
-            <div className={clsx(styles.stackRow, 'mt-5')}>
-              {stack.map((item) => (
-                <span
-                  key={item}
-                  className="rounded-md border border-line bg-soft px-2.5 py-1 font-mono text-[11px] text-muted"
-                >
-                  {item}
-                </span>
-              ))}
-            </div>
-          </article>
-
-          <article className="rounded-panel border border-line bg-elevated p-6 shadow-soft">
-            <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.14em] text-faint">
-              <PlugZap className="size-3.5" aria-hidden="true" />
-              接口代理
-            </div>
-
-            <div className="mt-4 flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="font-mono text-[12px] text-ink">/api → 127.0.0.1:8000</p>
-                <p className="mt-2 flex items-center gap-2 text-[11px] leading-5 text-muted">
-                  <span className={statusDot} aria-hidden="true" />
-                  <span aria-live="polite" className="break-words">
-                    {probe.message}
-                  </span>
+        <section className="flex-1 overflow-y-auto px-4 py-8 sm:px-8">
+          <div className="mx-auto flex min-h-full max-w-3xl flex-col gap-6">
+            {messages.length === 0 ? (
+              <div className="m-auto max-w-lg py-16 text-center">
+                <div className="mx-auto grid size-12 place-items-center rounded-lg border border-line bg-elevated">
+                  <MessageSquarePlus className="size-5 text-muted" />
+                </div>
+                <h2 className="mt-5 text-xl font-semibold">有什么可以帮你？</h2>
+                <p className="mt-2 text-sm text-muted">
+                  描述订单、商品或售后问题，CommerceMind 会为你提供协助。
                 </p>
               </div>
-
-              <button
-                type="button"
-                onClick={() => void rerunProbe()}
-                disabled={probe.kind === 'loading'}
-                className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-line bg-soft text-muted transition-colors hover:bg-hover hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
-                aria-label="重新检查后端连接"
-              >
-                {probe.kind === 'loading' ? (
-                  <LoaderCircle className="cm-spin size-3.5" aria-hidden="true" />
-                ) : (
-                  <RefreshCw className="size-3.5" aria-hidden="true" />
-                )}
-              </button>
-            </div>
-
-            <div className="mt-4 rounded-card border border-line bg-code px-3 py-2.5 font-mono text-[11px] leading-6 text-muted">
-              <span className="text-success">GET</span> /api/health
-              <br />
-              <span className="text-faint">→ proxy rewrite →</span> getHealth()
-            </div>
-          </article>
-
-          <article className="rounded-panel border border-line bg-elevated p-6 shadow-soft lg:col-span-2">
-            <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.14em] text-faint">
-              <Palette className="size-3.5" aria-hidden="true" />
-              设计令牌
-            </div>
-
-            <h2 className="mt-4 text-lg font-semibold tracking-tight">一套变量，两套主题</h2>
-            <p className="mt-2 text-sm leading-7 text-muted">
-              颜色、圆角、阴影与字体统一由 CSS 变量驱动，Tailwind 使用{' '}
-              <code className="font-mono text-[12px] text-ink">@theme inline</code>{' '}
-              映射为工具类，Less 模块直接消费同一组变量。切换主题不会触发页面刷新。
-            </p>
-
-            <div className={clsx(styles.tokenGrid, 'mt-5')}>
-              {tokens.map((token) => (
-                <div key={token.name} className="flex items-center gap-2.5">
-                  <span
-                    className="size-7 shrink-0 rounded-md border border-line"
-                    style={{ background: `var(${token.value})` }}
-                    aria-hidden="true"
-                  />
-                  <span className="text-[11px] text-muted">{token.name}</span>
-                </div>
-              ))}
-            </div>
-          </article>
-
-          <article className="rounded-panel border border-line bg-elevated p-6 shadow-soft">
-            <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.14em] text-faint">
-              <Server className="size-3.5" aria-hidden="true" />
-              实施进度
-            </div>
-
-            <ul className="mt-4 space-y-3">
-              {milestones.map((item) => (
-                <li key={item.label} className="flex items-center gap-2.5 text-[12px]">
-                  <span
-                    className={clsx(
-                      'inline-flex size-4 shrink-0 items-center justify-center rounded-full border',
-                      item.done
-                        ? 'border-success/30 bg-success/10 text-success'
-                        : 'border-line bg-soft text-faint',
-                    )}
-                    aria-hidden="true"
+            ) : (
+              messages.map((message) => (
+                <article
+                  key={message.id}
+                  className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  {message.role === 'assistant' && (
+                    <div className="grid size-8 shrink-0 place-items-center rounded-md bg-ink text-xs font-semibold text-canvas">
+                      C
+                    </div>
+                  )}
+                  <div
+                    className={`max-w-[85%] min-w-0 ${message.role === 'user' ? 'order-first' : ''}`}
                   >
-                    {item.done ? <Check className="size-2.5" /> : null}
-                  </span>
-                  <span className={item.done ? 'text-ink' : 'text-muted'}>{item.label}</span>
-                </li>
-              ))}
-            </ul>
-
-            <p className="mt-5 border-t border-line pt-4 text-[11px] leading-6 text-faint">
-              下一步：建立 sessionStore 与 chatStore，处理幂等、中断和竞态。
-            </p>
-          </article>
+                    <div
+                      className={`whitespace-pre-wrap break-words rounded-lg px-4 py-3 text-sm leading-7 ${message.role === 'user' ? 'bg-ink text-canvas' : 'border border-line bg-elevated'}`}
+                    >
+                      {message.content}
+                    </div>
+                    {message.role === 'assistant' && message.interrupted && (
+                      <div className="mt-1 text-[11px] text-faint">已中断</div>
+                    )}
+                    {message.status === 'pending' && (
+                      <div className="mt-1 flex items-center gap-3 text-[11px] text-faint">
+                        <span>正在回复…</span>
+                        <button
+                          onClick={() => {
+                            setEditingMessageId(message.id)
+                            stop()
+                            setDraft(message.content)
+                          }}
+                          className="inline-flex items-center gap-1 underline"
+                        >
+                          <Pencil className="size-3" />
+                          编辑
+                        </button>
+                      </div>
+                    )}
+                    {message.status === 'error' && (
+                      <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-danger">
+                        <span>{message.error}</span>
+                        {message.retryable && (
+                          <button
+                            onClick={() => void retry(message.id, sessionId, userId)}
+                            className="underline"
+                          >
+                            重试
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            setEditingMessageId(message.id)
+                            setDraft(message.content)
+                            requestAnimationFrame(() =>
+                              document.querySelector<HTMLTextAreaElement>('textarea')?.focus(),
+                            )
+                          }}
+                          className="inline-flex items-center gap-1 underline"
+                        >
+                          <Pencil className="size-3" />
+                          编辑
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {message.role === 'user' && (
+                    <div className="grid size-8 shrink-0 place-items-center rounded-md border border-line bg-elevated text-xs font-semibold">
+                      我
+                    </div>
+                  )}
+                </article>
+              ))
+            )}
+            <div ref={endRef} />
+          </div>
         </section>
 
-        <footer className="mt-auto flex flex-wrap items-center justify-between gap-3 pt-12 text-[10px] text-faint">
-          <span className="font-mono">frontend/ · p1 · 2026-11-13</span>
-          <span>Vite dev proxy · FastAPI same-origin in production</span>
-        </footer>
+        <div className="shrink-0 px-4 pb-5 sm:px-8 sm:pb-7">
+          <form
+            onSubmit={submit}
+            className="mx-auto flex max-w-3xl items-end gap-2 rounded-lg border border-line bg-elevated p-2 shadow-soft focus-within:border-line-strong"
+          >
+            <textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault()
+                  event.currentTarget.form?.requestSubmit()
+                }
+              }}
+              rows={2}
+              placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"
+              className="max-h-40 min-h-12 flex-1 resize-y bg-transparent px-3 py-2 text-sm leading-6 outline-none placeholder:text-faint"
+            />
+            {sending ? (
+              <button
+                type="button"
+                title="中断生成"
+                aria-label="中断生成"
+                onClick={stop}
+                className="grid size-10 shrink-0 place-items-center rounded-md bg-danger text-white"
+              >
+                <Square className="size-3.5" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                title={editingMessageId ? '编辑并重新发送' : '发送消息'}
+                aria-label={editingMessageId ? '编辑并重新发送' : '发送消息'}
+                disabled={!draft.trim()}
+                className="grid size-10 shrink-0 place-items-center rounded-md bg-ink text-canvas disabled:opacity-35"
+              >
+                <Send className="size-4" />
+              </button>
+            )}
+          </form>
+          <p className="mx-auto mt-2 max-w-3xl text-center text-[10px] text-faint">
+            回复内容由 AI 生成，请核实重要信息
+          </p>
+        </div>
       </main>
     </div>
   )

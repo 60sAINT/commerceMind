@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
+from anyio import CancelScope
 from redis.exceptions import WatchError
 
 logger = logging.getLogger(__name__)
@@ -114,8 +115,12 @@ async def redis_lease(
         raise
     finally:
         renewal.cancel()
-        await asyncio.gather(renewal, return_exceptions=True)
-        try:
-            await release()
-        except Exception as exc:
-            logger.warning("释放会话锁失败: %s", type(exc).__name__)
+        # Starlette 在客户端断连时用 anyio cancel scope 取消流任务，取消是持续生效的：
+        # 普通 await 会立刻再次抛出 CancelledError，导致 Redis 锁来不及释放并一直占住
+        # 会话直到租约到期。shield 保证续租任务收尾和 DEL 一定执行完。
+        with CancelScope(shield=True):
+            await asyncio.gather(renewal, return_exceptions=True)
+            try:
+                await release()
+            except Exception as exc:
+                logger.warning("释放会话锁失败: %s", type(exc).__name__)

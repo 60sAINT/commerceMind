@@ -34,6 +34,16 @@ class FakeLLM:
             raise self.error
         return ChatResult(self.text, input_tokens=10, output_tokens=5)
 
+    async def stream_chat(self, message: str, *, history=None, system=None):
+        self.calls.append(
+            {"message": message, "history": list(history or []), "system": system}
+        )
+        if self.error is not None:
+            raise self.error
+        for chunk in (self.text[: len(self.text) // 2], self.text[len(self.text) // 2 :]):
+            if chunk:
+                yield chunk
+
 
 def make_settings(
     *, memory_enabled: bool = True, debug: bool = False, api_key: str = "test-key",
@@ -122,7 +132,8 @@ async def test_chat_persists_intent_atomically_with_successful_turn(memory_env, 
     store, service = memory_env
     settings = make_settings(intent=IntentSettings(enabled=True))
     app = create_app(settings, memory=service)
-    app.state.llm = FakeLLM("退款会在 3-5 个工作日到账。")
+    fake_llm = FakeLLM("退款会在 3-5 个工作日到账。")
+    app.state.llm = fake_llm
 
     async def recognize(message, llm, intent_settings, *, history=None):
         assert message == "我的订单什么时候退款？"
@@ -137,6 +148,60 @@ async def test_chat_persists_intent_atomically_with_successful_turn(memory_env, 
     assert snapshot.state["intent"]["intent"] == "refund"
     assert snapshot.state["intent"]["confidence"] == 0.91
     assert "intent" not in response.json()
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_persists_intent_atomically_with_successful_turn(
+    memory_env, monkeypatch,
+):
+    store, service = memory_env
+    settings = make_settings(intent=IntentSettings(enabled=True))
+    app = create_app(settings, memory=service)
+    fake_llm = FakeLLM("退款会在 3-5 个工作日到账。")
+    app.state.llm = fake_llm
+
+    async def recognize(message, llm, intent_settings, *, history=None):
+        assert message == "我的订单什么时候退款？"
+        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
+
+    monkeypatch.setattr("api.main._recognize_intent", recognize)
+    response = await send(
+        app, "POST", "/chat/stream", json=chat_body("我的订单什么时候退款？"),
+    )
+
+    assert response.status_code == 200
+    assert "event: done" in response.text
+    snapshot = await store.get_snapshot("u1", "c1")
+    assert len(snapshot.turns) == 1
+    assert snapshot.state["intent"]["intent"] == "refund"
+    assert snapshot.state["intent"]["confidence"] == 0.91
+    assert '"intent": {"intent": "refund"' in fake_llm.calls[0]["system"]
+    assert '"intent"' not in response.text
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_failed_generation_does_not_persist_intent(
+    memory_env, monkeypatch,
+):
+    store, service = memory_env
+    settings = make_settings(intent=IntentSettings(enabled=True))
+    app = create_app(settings, memory=service)
+    app.state.llm = FakeLLM(error=LLMError("offline"))
+
+    calls = []
+
+    async def recognize(*args, **kwargs):
+        calls.append((args, kwargs))
+        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
+
+    monkeypatch.setattr("api.main._recognize_intent", recognize)
+    response = await send(app, "POST", "/chat/stream", json=chat_body("我要退款"))
+
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert len(calls) == 1
+    assert await store.get_state("u1", "c1") == {}
+    assert await store.get_turns("u1", "c1") == []
 
 
 @pytest.mark.asyncio

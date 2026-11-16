@@ -1,6 +1,7 @@
 """Redis 短期记忆测试：使用 fakeredis，不依赖真实 Redis。"""
 import asyncio
 
+import anyio
 import pytest
 import pytest_asyncio
 from fakeredis.aioredis import FakeRedis
@@ -203,6 +204,23 @@ async def test_redis_lease_serializes_concurrent_sections(redis_client):
         ["a:start", "a:end", "b:start", "b:end"],
         ["b:start", "b:end", "a:start", "a:end"],
     )
+
+
+@pytest.mark.asyncio
+async def test_redis_lease_releases_when_anyio_cancels(redis_client):
+    """客户端断连时 Starlette 用 anyio cancel scope 取消流任务，锁仍必须释放。"""
+    key = "lock:test:anyio-cancel"
+
+    async def worker():
+        async with redis_lease(redis_client, key, wait_s=5, lease_s=30):
+            await anyio.sleep(30)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(worker)
+        await anyio.sleep(0.05)
+        task_group.cancel_scope.cancel()
+
+    assert not await redis_client.exists(key)
 
 
 @pytest.mark.asyncio

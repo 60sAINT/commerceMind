@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -129,6 +130,45 @@ class LLMClient:
         """发送当前问题及可选历史，返回文本和 usage。"""
         messages = _build_messages(message, history)
         return await self._generate(messages, system=system or SYSTEM_PROMPT)
+
+    async def stream_chat(
+        self,
+        message: str,
+        *,
+        history: Sequence[dict[str, Any]] | None = None,
+        system: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield text deltas; cancellation closes the upstream Anthropic stream."""
+        messages = _build_messages(message, history)
+        try:
+            async with asyncio.timeout(self.settings.timeout_s):
+                async with self._client.messages.stream(
+                    model=self.settings.model,
+                    max_tokens=self.settings.max_tokens,
+                    system=system or SYSTEM_PROMPT,
+                    messages=messages,
+                ) as stream:
+                    async for text in stream.text_stream:
+                        if text:
+                            yield text
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, anthropic.APITimeoutError) as ex:
+            raise LLMError("模型响应超时，请稍后重试", status_code=503, code="llm_timeout") from ex
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as ex:
+            raise LLMError("模型鉴权失败，请检查 ANTHROPIC_API_KEY 和 ANTHROPIC_BASE_URL", status_code=502, code="llm_auth_failed") from ex
+        except anthropic.NotFoundError as ex:
+            raise LLMError("模型或接口地址不存在，请检查配置", status_code=502, code="llm_not_found") from ex
+        except anthropic.BadRequestError as ex:
+            raise LLMError("模型请求参数错误，请检查配置和消息内容", status_code=502, code="llm_bad_request") from ex
+        except anthropic.RateLimitError as ex:
+            raise LLMError("模型服务限流，请稍后重试", status_code=503, code="llm_rate_limited") from ex
+        except anthropic.APIConnectionError as ex:
+            raise LLMError("无法连接模型服务，请检查网络", status_code=503, code="llm_connection_failed") from ex
+        except anthropic.APIStatusError as ex:
+            raise LLMError("模型服务返回错误，请稍后重试", status_code=502, code="llm_upstream_error") from ex
+        except anthropic.APIError as ex:
+            raise LLMError("模型服务异常，请稍后重试", status_code=502, code="llm_api_error") from ex
 
     async def summarize(self, prompt: str) -> str:
         """供 MemoryCompactor 注入使用；模型输出被截断时不能提交摘要。"""
