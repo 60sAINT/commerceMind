@@ -60,6 +60,8 @@ export interface SkillSummary {
 }
 
 export interface SkillsResponse {
+  management_enabled?: boolean
+  limits?: { max_file_bytes: number; max_total_bytes: number; max_files: number }
   enabled: boolean
   count: number
   skills: SkillSummary[]
@@ -78,6 +80,26 @@ export interface SkillReloadReport {
   loaded_at: string
   duration_ms: number
   count: number
+}
+
+export interface SkillFile {
+  path: string
+  content: string
+}
+export interface SkillPackage {
+  id: string
+  files: SkillFile[]
+  revision: string
+}
+export interface SkillMutationResult {
+  skill: SkillSummary
+  report: SkillReloadReport
+  revision: string
+}
+export interface SkillUploadPreview {
+  skill: SkillSummary
+  file_count: number
+  total_bytes: number
 }
 
 export interface MemoryTurn {

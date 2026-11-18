@@ -1,30 +1,28 @@
-import { useCallback, useEffect } from 'react'
-import { AlertTriangle, Clock3, RefreshCw, Sparkles } from 'lucide-react'
-
+import { useCallback, useEffect, useState } from 'react'
+import { RefreshCw, Trash2 } from 'lucide-react'
 import { useSkillsStore } from '@/stores/skills'
+import { deleteSkillPackage, getSkillPackage } from '@/services/skills'
 import { Sheet } from '@/components/ui/Sheet'
+import { SkillUpload } from './SkillUpload'
+import type { SkillSummary } from '@/types/api'
 
 interface SkillsPanelProps {
   open: boolean
   onClose: () => void
 }
 
-function formatLoadedAt(value: string): string {
-  if (!value) return '未知'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString('zh-CN', { hour12: false })
-}
-
 export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
-  const data = useSkillsStore((state) => state.data)
-  const loading = useSkillsStore((state) => state.loading)
-  const error = useSkillsStore((state) => state.error)
-  const reloading = useSkillsStore((state) => state.reloading)
-  const reloadMessage = useSkillsStore((state) => state.reloadMessage)
-  const load = useSkillsStore((state) => state.load)
-  const reload = useSkillsStore((state) => state.reload)
-  const clearReloadMessage = useSkillsStore((state) => state.clearReloadMessage)
+  const { data, loading, error, reloading, reloadMessage, load, reload, clearReloadMessage } =
+    useSkillsStore()
+  const [busy, setBusy] = useState(false)
+  const [deleting, setDeleting] = useState<SkillSummary | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const locked = busy || reloading || loading
+  const canManage = Boolean(data?.enabled && data.management_enabled)
+  const close = useCallback(() => {
+    if (!busy && !reloading) onClose()
+  }, [busy, reloading, onClose])
 
   useEffect(() => {
     if (!open) return
@@ -32,144 +30,167 @@ export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
     void load(true)
   }, [clearReloadMessage, load, open])
 
-  const handleReload = useCallback(() => {
-    void reload()
-  }, [reload])
+  useEffect(() => {
+    if (!busy) return
+    const prevent = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', prevent)
+    return () => window.removeEventListener('beforeunload', prevent)
+  }, [busy])
+
+  async function remove() {
+    if (!deleting || locked) return
+    setBusy(true)
+    setActionError(null)
+    setMessage(null)
+    try {
+      const pkg = await getSkillPackage(deleting.id)
+      await deleteSkillPackage(deleting.id, pkg.revision)
+      setDeleting(null)
+      setMessage('技能已删除。')
+      await load(true)
+      if (useSkillsStore.getState().error) setMessage('技能已删除，列表刷新失败，请重新加载。')
+    } catch (e) {
+      setActionError(
+        `${e instanceof Error ? e.message : '删除失败'}。若为网络异常，请刷新列表确认结果。`,
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <Sheet
       open={open}
-      onClose={onClose}
+      onClose={close}
       title="技能"
-      description="后端从 SKILL.md 加载的能力目录，正文不会在这里展示。"
+      description="上传技能后，可在聊天输入框用 / 选择。"
       width="lg"
     >
       <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs text-muted">
-          <Sparkles className="size-4" />
-          {data ? (
-            <span>
-              {data.enabled ? `已启用 · ${data.count} 个` : '未启用'}
-              {data.version > 0 && ` · v${data.version}`}
-            </span>
-          ) : (
-            <span>{loading ? '正在加载…' : '暂无数据'}</span>
-          )}
-        </div>
+        <p className="text-xs text-muted">
+          {data
+            ? data.enabled
+              ? `${data.count} 个技能 · 已启用`
+              : '技能未启用'
+            : loading
+              ? '正在加载…'
+              : '暂无数据'}
+        </p>
         <button
           type="button"
-          onClick={handleReload}
-          disabled={reloading || loading}
-          className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[11px] text-muted transition-colors hover:bg-hover hover:text-ink disabled:opacity-50"
+          disabled={locked}
+          onClick={() => {
+            setActionError(null)
+            void reload()
+          }}
+          className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted hover:bg-hover disabled:opacity-50"
         >
-          <RefreshCw className={`size-3 ${reloading ? 'cm-spin' : ''}`} />
+          <RefreshCw className={`size-3.5 ${reloading ? 'cm-spin' : ''}`} />
           重新加载
         </button>
       </div>
-
-      {data && (
-        <dl className="mt-3 grid grid-cols-2 gap-2 rounded-lg border border-line bg-soft px-3 py-2 text-[10px] text-muted">
-          <div className="min-w-0">
-            <dt className="text-faint">目录版本</dt>
-            <dd className="mt-0.5 font-mono text-[11px] text-ink">
-              {data.version > 0 ? `v${data.version}` : '—'}
-            </dd>
-          </div>
-          <div className="min-w-0">
-            <dt className="inline-flex items-center gap-1 text-faint">
-              <Clock3 className="size-3" />
-              加载时间
-            </dt>
-            <dd className="mt-0.5 truncate text-[11px] text-ink" title={data.loaded_at}>
-              {formatLoadedAt(data.loaded_at)}
-            </dd>
-          </div>
-        </dl>
+      {canManage && (
+        <fieldset disabled={locked || Boolean(deleting)} className="min-w-0">
+          <SkillUpload onBusy={setBusy} />
+        </fieldset>
       )}
-
-      {reloadMessage && (
-        <p className="mt-3 rounded-md border border-line bg-soft px-3 py-2 text-[11px] leading-5 text-muted">
-          {reloadMessage}
+      {data?.enabled && !data.management_enabled && (
+        <p className="mt-4 text-xs leading-5 text-muted">
+          当前为只读模式。上传和删除需要后端启用 skills.enabled 与 skills.debug。
         </p>
       )}
-
-      {error && (
-        <div className="mt-3 flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-[11px] leading-5 text-danger">
-          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-          <span>{error}</span>
-        </div>
-      )}
-
-      {loading && !data && (
-        <div className="mt-4 space-y-2" role="status" aria-label="正在加载技能">
-          {[0, 1, 2].map((item) => (
-            <div key={item} className="h-16 animate-pulse rounded-lg border border-line bg-soft" />
-          ))}
-        </div>
-      )}
-
       {data && !data.enabled && (
-        <div className="mt-4 rounded-lg border border-line bg-soft px-4 py-6 text-center">
-          <p className="text-xs font-medium">技能功能未启用</p>
-          <p className="mt-1.5 text-[11px] leading-5 text-muted">
-            在后端配置 <code className="font-mono">COMMERCEMIND_SKILLS_ENABLED=true</code>{' '}
-            并挂载技能目录后，这里会显示可用的 SKILL.md 目录。
+        <p className="mt-4 rounded-lg bg-soft p-4 text-xs leading-5 text-muted">
+          后端尚未启用技能。请配置 COMMERCEMIND_SKILLS_ENABLED=true 并挂载技能目录。
+        </p>
+      )}
+      {(error || actionError) && (
+        <p role="alert" className="mt-3 text-xs leading-5 text-danger">
+          {actionError || error}
+        </p>
+      )}
+      {(message || reloadMessage) && (
+        <p role="status" className="mt-3 text-xs leading-5 text-muted">
+          {message || reloadMessage}
+        </p>
+      )}
+      {deleting && (
+        <div className="mt-4 rounded-lg border border-danger/30 bg-danger/5 p-3 text-xs">
+          <p className="break-words leading-5">
+            确认删除 {deleting.name}？技能文件将移除，之后的聊天不再使用它；已有聊天记录保留。
           </p>
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              disabled={locked}
+              onClick={() => void remove()}
+              className="rounded bg-danger px-3 py-1.5 text-white disabled:opacity-50"
+            >
+              {busy ? '正在删除…' : '确认删除'}
+            </button>
+            <button
+              type="button"
+              disabled={locked}
+              onClick={() => {
+                setDeleting(null)
+                setActionError(null)
+              }}
+              className="rounded border border-line px-3 py-1.5 hover:bg-hover disabled:opacity-50"
+            >
+              取消
+            </button>
+          </div>
         </div>
       )}
-
       {data && data.skills.length > 0 && (
-        <ul className="mt-4 space-y-2">
+        <ul className="mt-5 divide-y divide-line">
           {data.skills.map((skill) => (
-            <li key={skill.id} className="rounded-lg border border-line bg-elevated px-3.5 py-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="truncate text-xs font-medium">{skill.name}</p>
-                  <p className="mt-0.5 font-mono text-[10px] text-faint">/{skill.id}</p>
-                </div>
-                <span
-                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${
-                    skill.enabled ? 'bg-success/10 text-success' : 'bg-soft text-faint'
-                  }`}
-                >
-                  {skill.enabled ? '启用' : '停用'}
-                </span>
+            <li key={skill.id} className="flex items-start gap-3 py-4">
+              <div className="min-w-0 flex-1">
+                <p className="break-words text-sm font-medium">{skill.name}</p>
+                <p className="mt-1 break-all font-mono text-[10px] text-faint">/{skill.id}</p>
+                <p className="mt-1.5 break-words text-xs leading-5 text-muted">
+                  {skill.description}
+                </p>
               </div>
-              {skill.description && (
-                <p className="mt-1.5 text-[11px] leading-5 text-muted">{skill.description}</p>
-              )}
-              {skill.keywords.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {skill.keywords.map((keyword) => (
-                    <span
-                      key={keyword}
-                      className="rounded border border-line px-1.5 py-0.5 text-[10px] text-faint"
-                    >
-                      {keyword}
-                    </span>
-                  ))}
-                </div>
+              {canManage && (
+                <button
+                  type="button"
+                  aria-label={`删除 ${skill.name}`}
+                  disabled={locked || Boolean(deleting)}
+                  onClick={() => {
+                    setDeleting(skill)
+                    setActionError(null)
+                    setMessage(null)
+                  }}
+                  className="shrink-0 rounded p-2 text-faint hover:bg-hover hover:text-danger disabled:opacity-50"
+                >
+                  <Trash2 className="size-4" />
+                </button>
               )}
             </li>
           ))}
         </ul>
       )}
-
-      {data && data.enabled && data.skills.length === 0 && !loading && (
-        <p className="mt-4 text-xs text-muted">技能目录为空。</p>
+      {data?.enabled && !data.skills.length && !loading && (
+        <p className="mt-6 text-center text-xs text-muted">还没有技能，上传第一个试试。</p>
       )}
-
       {data && data.errors.length > 0 && (
-        <div className="mt-4">
-          <p className="text-[11px] font-medium text-warning">加载异常</p>
-          <ul className="mt-1.5 space-y-1">
+        <details className="mt-4 text-xs text-muted">
+          <summary className="cursor-pointer text-warning">
+            {data.errors.length} 个文件加载异常
+          </summary>
+          <ul className="mt-2 space-y-1">
             {data.errors.map((item) => (
-              <li key={`${item.path}-${item.message}`} className="text-[11px] leading-5 text-muted">
-                <span className="font-mono text-faint">{item.path}</span> · {item.message}
+              <li key={item.path + item.message} className="break-all leading-5">
+                {item.path} · {item.message}
               </li>
             ))}
           </ul>
-        </div>
+        </details>
       )}
     </Sheet>
   )

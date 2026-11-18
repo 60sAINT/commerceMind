@@ -303,7 +303,7 @@ docker compose up -d --force-recreate commercemind
 - 显式传 `skill_ids: []` 可关闭本轮自动选择（消息有 slash 命令时仍执行手动选择）。
 - 每轮重新选技，不把选中状态永久绑定到会话。正文按需加载并缓存，加入 system 时保留原有系统角色和记忆上下文；不读取包内资源内容。
 - 自动选择最多额外调用一次模型，最多等待 8 秒；未匹配、超时、调用失败或返回非法/越界 id 时不加载正文，继续普通回答。选择目录 JSON 受目录预算限制，放不下的条目跳过；完整目录可通过 GET 获取并手动选择。
-- 前端在 `frontend/`：输入 `/` 会弹出 `GET /skills` 的技能候选菜单，支持按 id、名称、描述、关键词过滤与 `↑` / `↓` / `Enter` 选择；选中项以 chip 展示，最多 3 个，发送时作为 `skill_ids` 传给后端。也可以直接手输 `/skill_id 问题内容`，前端会把手输命令里已有的技能从 `skill_ids` 中剔除，避免重复。单独发送 `/billing_support` 时后端返回 `422 skill_message_required`，前端映射为“选择技能后还需要输入问题，请在 /技能名 后补充具体问题”。技能面板展示目录版本、加载时间与解析错误，并支持 `POST /skills/reload`（未开启热重载时提示“当前环境未开启技能热重载”）。
+- 前端在 `frontend/`：输入 `/` 会弹出 `GET /skills` 的技能候选菜单，支持按 id、名称、描述、关键词过滤与 `↑` / `↓` / `Enter` 选择；选中项以 chip 展示，最多 3 个，发送时作为 `skill_ids` 传给后端。也可以直接手输 `/skill_id 问题内容`，前端会把手输命令里已有的技能从 `skill_ids` 中剔除，避免重复。单独发送 `/billing_support` 时后端返回 `422 skill_message_required`，前端映射为“选择技能后还需要输入问题，请在 /技能名 后补充具体问题”。技能面板提供 SKILL.md/ZIP 上传、确认启用、列表与删除，支持 `POST /skills/reload`，加载异常可展开查看。
 - 原始消息保留在记忆与幂等回执中；发给本轮回答模型的问题去除开头的 Skill 命令。
 - Skills 关闭时，不创建管理器，不注入目录或正文，忽略 `skill_ids`，原有模型调用与记忆行为保持不变。
 
@@ -318,7 +318,8 @@ curl -X POST http://localhost:8000/chat/stream \
   -d '{"message":"/billing_support 退款一般多久到账？"}'
 ```
 
-`GET /skills` 返回 `enabled/count/skills/errors/version/loaded_at`，
+`GET /skills` 返回 `enabled/count/skills/errors/version/loaded_at/management_enabled`，
+启用时还返回文件管理 `limits`（单文件/整包字节数与文件数量）。
 只包含元数据摘要，不包含正文、资源内容或正常目录项的服务器绝对路径。
 关闭时返回 `enabled=false`、空目录、版本 0。
 未知或已删除的 Skill 返回 HTTP 404，`error_code=skill_not_found`；
@@ -340,7 +341,7 @@ curl -X POST http://localhost:8000/chat/stream \
 相同消息与请求 id 会回放原答案，不会因 Skill 选择改变而重新调用模型。
 
 当前没有鉴权，只有同时设置 `COMMERCEMIND_SKILLS_ENABLED=true` 和
-`COMMERCEMIND_SKILLS_DEBUG=true` 才注册 `POST /skills/reload`，否则返回 404，
+`COMMERCEMIND_SKILLS_DEBUG=true` 才注册以下管理接口，否则返回 404，
 OpenAPI 中也没有此路由。请仅在可信本地环境打开 debug。
 
 ```bash
@@ -350,5 +351,32 @@ curl -X POST http://localhost:8000/skills/reload
 重载返回 `added/updated/removed/unchanged/errors/version/loaded_at/duration_ms/count`，
 不返回正文；重新扫描目录、原子替换快照并清空正文缓存，后续请求使用新目录及正文。
 重载只影响当前服务进程，多 worker 部署需逐进程重载或重启。
+
+前端「技能」→「上传技能」选择单个 `SKILL.md` 或 ZIP，校验通过后展示名称、描述和文件数，
+点击「上传并启用」才正式安装。界面保留技能列表、删除确认和重新加载，不提供在线文件编辑器。
+ZIP 必须只包含一个根技能文件夹，例如 `my-skill/SKILL.md` 与 `my-skill/references/...`，
+不接受把 SKILL.md 直接散放在 ZIP 根目录。新上传技能的 `name` 使用小写字母、数字、连字符，
+最多 64 字符，ZIP 根文件夹名必须与 name 一致；已有中文名称/下划线 ID 的技能继续兼容。
+现有上传预算保持不变：默认单文件 64KiB、整包 1MiB、64 个文本文件；同时约束 ZIP 原始大小和解压后大小。
+这是格式/路径/压缩包安全校验，不包含语义恶意内容扫描或人工审核流程。
+
+| 方法与路径 | 输入 | 行为 |
+| --- | --- | --- |
+| `POST /skills/upload/preview?filename=...` | 原始 `.md` / ZIP 字节 | 校验并返回 skill/file_count/total_bytes，不写正式目录、不发布快照 |
+| `POST /skills/upload?filename=...` | 同一文件的原始字节 | 重新校验、创建技能并 reload，同名 409，不覆盖 |
+| `GET /skills/{id}/files` | 路径 ID | 返回 `id/files:[{path,content}]/revision`，读取完整可编辑文本包 |
+| `POST /skills/import` | `id/files` | 创建包并重载，同名默认 409；兼容已有显式 `overwrite` 参数 |
+| `PUT /skills/{id}/files` | `files/revision` | 按完整文件清单替换包并重载，未列出的旧资源删除 |
+| `DELETE /skills/{id}` | query `revision` | 删除整个包并重载 |
+| `POST /skills/reload` | 无 | 重新扫描磁盘文件，发布新目录快照、清空正文缓存 |
+
+确认上传的接口内部已执行 reload，前端只刷新 GET 目录，不再重复 POST reload。
+JSON 文件接口保留兼容既有调用，前端不再展示编辑入口。编辑和删除使用读取时的 SHA-256 内容版本 `revision`；文件发生变化则 409，避免覆盖并发修改。
+上传只接受 UTF-8 文本：根 `SKILL.md` 和 `references/`、`templates/`、`scripts/` 下资源，
+默认单文件 64KiB、整包 1MiB、64 个文件。符号链接、越界路径、隐藏文件及二进制资源拒绝管理，
+防止完整替换时静默丢失不能编辑的文件；脚本仅保存，不执行。
+写入采用暂存校验、备份、rename 安装和失败时尽力恢复；普通上传失败保留所选文件供重试，
+网络中断导致结果未知时应先刷新列表核对。Compose 将 `./skills` 可写挂载至 `/app/skills`，重建容器后文件仍保留。
+此机制由显式请求触发，无目录监听器；进程内锁不覆盖多 worker 或外部程序直接改文件。
 
 验证：`python -m pytest -q tests/test_skill_api.py tests/test_skill_loader.py tests/test_skill_content.py`。

@@ -1,5 +1,11 @@
 import { requestJson } from '@/api'
-import type { SkillReloadReport, SkillsResponse } from '@/types/api'
+import type {
+  SkillReloadReport,
+  SkillsResponse,
+  SkillPackage,
+  SkillMutationResult,
+  SkillUploadPreview,
+} from '@/types/api'
 
 interface SkillsOptions {
   signal?: AbortSignal
@@ -24,4 +30,37 @@ export function reloadSkills(options: SkillsOptions = {}): Promise<SkillReloadRe
     signal: options.signal,
     timeoutMs: options.timeoutMs ?? 30_000,
   })
+}
+
+export function getSkillPackage(id: string, signal?: AbortSignal) {
+  return requestJson<SkillPackage>(`/skills/${encodeURIComponent(id)}/files`, { signal })
+}
+export function previewSkillUpload(file: File, signal?: AbortSignal) {
+  return requestJson<SkillUploadPreview>('/skills/upload/preview', {
+    method: 'POST',
+    body: file,
+    params: { filename: file.name },
+    headers: { 'Content-Type': 'application/octet-stream' },
+    signal,
+    timeoutMs: 30_000,
+  })
+}
+export function uploadSkill(file: File) {
+  return requestJson<SkillMutationResult>('/skills/upload', {
+    method: 'POST',
+    body: file,
+    params: { filename: file.name },
+    headers: { 'Content-Type': 'application/octet-stream' },
+    timeoutMs: 30_000,
+  })
+}
+export function deleteSkillPackage(id: string, revision: string) {
+  return requestJson<{ deleted: boolean; report: SkillReloadReport }>(
+    `/skills/${encodeURIComponent(id)}`,
+    {
+      method: 'DELETE',
+      params: { revision },
+      timeoutMs: 30_000,
+    },
+  )
 }

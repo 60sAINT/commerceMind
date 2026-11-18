@@ -119,12 +119,24 @@ class SkillSettings:
     resource_max_chars: int = 20480
     max_selected_skills: int = 3
     debug: bool = False
+    # 导入接口的上传预算；只在前端上传 Skill 时使用。
+    upload_max_file_bytes: int = 64 * 1024
+    upload_max_total_bytes: int = 1024 * 1024
+    upload_max_files: int = 64
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root_dir", str(self.root_dir).strip())
         if not self.root_dir:
             raise ValueError("Skill root_dir 不能为空")
-        for name in ("catalog_max_chars", "body_max_chars", "resource_max_chars", "max_selected_skills"):
+        for name in (
+            "catalog_max_chars",
+            "body_max_chars",
+            "resource_max_chars",
+            "max_selected_skills",
+            "upload_max_file_bytes",
+            "upload_max_total_bytes",
+            "upload_max_files",
+        ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} 必须是正整数")
@@ -184,6 +196,9 @@ class Settings:
                 resource_max_chars=_env_int("COMMERCEMIND_SKILLS_RESOURCE_MAX_CHARS", 20480),
                 max_selected_skills=_env_int("COMMERCEMIND_SKILLS_MAX_SELECTED_SKILLS", 3),
                 debug=_env_bool("COMMERCEMIND_SKILLS_DEBUG", False),
+                upload_max_file_bytes=_env_int("COMMERCEMIND_SKILLS_UPLOAD_MAX_FILE_BYTES", 64 * 1024),
+                upload_max_total_bytes=_env_int("COMMERCEMIND_SKILLS_UPLOAD_MAX_TOTAL_BYTES", 1024 * 1024),
+                upload_max_files=_env_int("COMMERCEMIND_SKILLS_UPLOAD_MAX_FILES", 64),
             ),
             memory=MemorySettings(
                 enabled=_env_bool("COMMERCEMIND_MEMORY_ENABLED", False),

@@ -4,7 +4,9 @@
 
     GET  /health  -> 检查服务、模型和记忆依赖（Redis/Chroma）
     POST /chat/stream -> SSE：读 working memory / 意图识别 -> 流式生成 -> 原子提交本轮
-    GET  /skills  -> Skill 轻量目录；POST /skills/reload 仅在 Skills debug 开启时注册
+    GET  /skills  -> Skill 轻量目录
+    POST /skills/reload -> 热重载；POST /skills/import -> 导入技能包（均需 Skills debug 开启）
+    GET/PUT /skills/{id}/files；DELETE /skills/{id} -> 文件管理（同样需 debug）
 
 不包含 Agent 路由、RAG、MCP 和监控；长期记忆检索暂未接入。
 """
@@ -30,7 +32,17 @@ from core.intent_fusion import combine_intents
 from core.intent_llm import IntentLLMClassifier
 from core.intent_pattern import recognize_pattern
 from core.llm import SYSTEM_PROMPT, LLMClient, LLMError
+from core.skill_install import (
+    SkillImportFile,
+    SkillImportLimits,
+    SkillInstallError,
+    install_skill,
+    read_package,
+    delete_skill,
+    reload_skills as reload_skill_directory,
+)
 from core.skill_loader import SkillBodyError, SkillManager, SkillNotFoundError
+from core.skill_upload import prepare_upload
 from core.skill_selection import parse_skill_commands, select_skills
 from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
@@ -54,6 +66,26 @@ class HealthResponse(BaseModel):
     model: str
     memory: MemoryHealth
     detail: str | None = None
+
+
+class SkillImportFileModel(BaseModel):
+    """导入包里的单个文本文件；路径必须是包内相对路径。"""
+
+    path: str = Field(min_length=1, max_length=256)
+    content: str = Field(max_length=256 * 1024)
+
+
+class SkillImportRequest(BaseModel):
+    """POST /skills/import 的请求体。"""
+
+    id: str = Field(min_length=1, max_length=64)
+    overwrite: bool = False
+    files: list[SkillImportFileModel] = Field(min_length=1, max_length=256)
+
+
+class SkillSaveRequest(BaseModel):
+    revision: str = Field(min_length=64, max_length=64)
+    files: list[SkillImportFileModel] = Field(min_length=1, max_length=256)
 
 
 class ChatRequest(BaseModel):
@@ -245,6 +277,10 @@ def create_app(
     app.state.memory = memory
     app.state.sessions = None
     app.state.skill_manager = None
+
+    @app.exception_handler(SkillInstallError)
+    async def skill_install_error_handler(request: Request, exc: SkillInstallError):
+        return _error_response(uuid.uuid4().hex[:12], exc.status, str(exc), error_code=exc.code)
     if settings.skills.enabled:
         manager = SkillManager(
             settings.skills.root_dir,
@@ -261,9 +297,13 @@ def create_app(
         if manager is None:
             return {
                 "enabled": False, "count": 0, "skills": [],
-                "errors": [], "version": 0, "loaded_at": "",
+                "errors": [], "version": 0, "loaded_at": "", "management_enabled": False,
             }
-        return {"enabled": True, **manager.summary()}
+        return {"enabled": True, **manager.summary(),
+                "management_enabled": settings.skills.debug,
+                "limits": {"max_file_bytes": settings.skills.upload_max_file_bytes,
+                           "max_total_bytes": settings.skills.upload_max_total_bytes,
+                           "max_files": settings.skills.upload_max_files}}
 
     @app.post("/sessions", tags=["会话"])
     async def create_session(user_id: str = Query(min_length=1, max_length=128)):
@@ -316,10 +356,103 @@ def create_app(
         return {"deleted": True}
 
     if settings.skills.enabled and settings.skills.debug:
+        def import_limits():
+            return SkillImportLimits(
+                max_file_bytes=settings.skills.upload_max_file_bytes,
+                max_total_bytes=settings.skills.upload_max_total_bytes,
+                max_files=settings.skills.upload_max_files,
+            )
+
+        async def skill_operation(function, *args, **kwargs):
+            try:
+                return await asyncio.to_thread(function, *args, **kwargs)
+            except SkillInstallError:
+                raise
+            except Exception as exc:
+                logger.exception("Skill 文件管理失败")
+                raise SkillInstallError("skill_install_failed", "技能文件操作失败，已尝试恢复原目录，请重新读取确认", status=500) from exc
+
+        async def read_upload(request: Request, filename: str):
+            chunks = []
+            size = 0
+            limits = import_limits()
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limits.max_total_bytes:
+                    raise SkillInstallError("skill_package_too_large", "上传文件超过大小限制", status=413)
+                chunks.append(chunk)
+            return await skill_operation(prepare_upload, app.state.skill_manager, filename, b''.join(chunks), limits)
+
+        @app.post("/skills/upload/preview", tags=["Skills"])
+        async def preview_skill_upload(request: Request, filename: str = Query(min_length=1, max_length=256)):
+            package = await read_upload(request, filename)
+            if (app.state.skill_manager.root_dir / package.id).exists():
+                raise SkillInstallError("skill_exists", "同名技能已存在，请先删除旧技能或修改包的 name 后重新上传", status=409)
+            return package.preview()
+
+        @app.post("/skills/upload", tags=["Skills"])
+        async def upload_skill(request: Request, filename: str = Query(min_length=1, max_length=256)):
+            package = await read_upload(request, filename)
+            result = await skill_operation(install_skill, app.state.skill_manager, package.id,
+                                           package.files, limits=import_limits())
+            return {"skill": result.descriptor.to_summary(), "report": result.report.to_dict(), "revision": result.revision}
+
+        @app.get("/skills/{skill_id}/files", tags=["Skills"])
+        async def skill_files(skill_id: str):
+            return await skill_operation(read_package, app.state.skill_manager, skill_id, import_limits())
+
+        @app.put("/skills/{skill_id}/files", tags=["Skills"])
+        async def save_skill_files(skill_id: str, req: SkillSaveRequest):
+            result = await skill_operation(
+                install_skill, app.state.skill_manager, skill_id,
+                [SkillImportFile(path=f.path, content=f.content) for f in req.files],
+                overwrite=True, limits=import_limits(), expected_revision=req.revision,
+            )
+            return {"skill": result.descriptor.to_summary(), "report": result.report.to_dict(), "revision": result.revision}
+
+        @app.delete("/skills/{skill_id}", tags=["Skills"])
+        async def remove_skill(skill_id: str, revision: str = Query(min_length=64, max_length=64)):
+            report = await skill_operation(delete_skill, app.state.skill_manager, skill_id, revision, import_limits())
+            return {"deleted": True, "report": report.to_dict()}
+
         @app.post("/skills/reload", tags=["Skills"])
         async def reload_skills() -> dict[str, Any]:
-            report = await asyncio.to_thread(app.state.skill_manager.reload)
+            report = await skill_operation(reload_skill_directory, app.state.skill_manager)
             return report.to_dict()
+
+        @app.post("/skills/import", tags=["Skills"])
+        async def import_skill(req: SkillImportRequest) -> Any:
+            """写入 `skills/<id>/` 并立即重载；失败时保持旧目录可用。"""
+            request_id = uuid.uuid4().hex[:12]
+            manager = app.state.skill_manager
+            limits = SkillImportLimits(
+                max_file_bytes=settings.skills.upload_max_file_bytes,
+                max_total_bytes=settings.skills.upload_max_total_bytes,
+                max_files=settings.skills.upload_max_files,
+            )
+            try:
+                result = await asyncio.to_thread(
+                    install_skill,
+                    manager,
+                    req.id,
+                    [SkillImportFile(path=item.path, content=item.content) for item in req.files],
+                    overwrite=req.overwrite,
+                    limits=limits,
+                )
+            except SkillInstallError as exc:
+                return _error_response(request_id, exc.status, str(exc), error_code=exc.code)
+            except OSError:
+                logger.exception("Skill 导入写入失败: id=%s", req.id)
+                return _error_response(
+                    request_id,
+                    500,
+                    "写入技能目录失败，请确认 skills 目录可写",
+                    error_code="skill_install_failed",
+                )
+            except Exception:
+                logger.exception("Skill 导入或重载失败: id=%s", req.id)
+                return _error_response(request_id, 500, "技能保存或重载失败，已尝试回滚，请重新读取确认", error_code="skill_install_failed")
+            return {"skill": result.descriptor.to_summary(), "report": result.report.to_dict(), "revision": result.revision}
 
     if settings.model_configured:
         logger.info(

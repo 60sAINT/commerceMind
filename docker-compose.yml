@@ -19,6 +19,9 @@ services:
     container_name: commercemind-app
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      # 前端导入的 Skill 直接写到宿主机 ./skills，重建镜像后仍然保留。
+      - ./skills:/app/skills
     env_file:
       - path: .env
         required: false

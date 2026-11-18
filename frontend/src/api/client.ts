@@ -22,7 +22,7 @@ export function getApiBaseUrl(): string {
 export const DEFAULT_TIMEOUT_MS = 60_000
 
 export interface RequestOptions {
-  method?: 'GET' | 'POST' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   /** JSON 请求体，axios 会自动序列化并设置 Content-Type。 */
   body?: unknown
   /** URL 查询参数，值为 undefined / null 时由 axios 跳过。 */
