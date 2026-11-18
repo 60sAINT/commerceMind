@@ -3,6 +3,7 @@ import { createJSONStorage, persist } from 'zustand/middleware'
 
 import { isApiError } from '@/api'
 import { createRequestId } from '@/lib/id'
+import { dedupeSkillIds } from '@/lib/skills'
 import { streamChat } from '@/services/chat'
 import { useSessionStore } from '@/stores/session'
 import type { ChatRequest } from '@/types/api'
@@ -16,6 +17,8 @@ export interface ChatMessage {
   status?: 'pending' | 'error'
   error?: string
   retryable?: boolean
+  /** 随这条用户消息发送的技能 id，重试/编辑重发时沿用。 */
+  skillIds?: string[]
   /** 中断时保留的助手片段，仅用于展示，不参与后端上下文。 */
   interrupted?: boolean
 }
@@ -30,6 +33,7 @@ interface ChatState {
     text: string,
     sessionId: string,
     userId: string,
+    skillIds?: string[],
   ) => Promise<void>
   retry: (messageId: string, sessionId: string, userId: string) => Promise<void>
   stop: () => void
@@ -135,12 +139,13 @@ async function runRequest(
   useChatStore.setState({ sendingSessionId: sessionId, activeRequestId: requestId })
 
   try {
+    const effectiveSkillIds = skillIds?.length ? dedupeSkillIds(text, skillIds) : []
     const payload: ChatRequest = {
       message: text,
       user_id: userId,
       session_id: sessionId || null,
       client_request_id: requestId,
-      ...(skillIds ? { skill_ids: skillIds } : {}),
+      ...(effectiveSkillIds.length ? { skill_ids: effectiveSkillIds } : {}),
     }
     const response = await streamChat(
       payload,
@@ -269,6 +274,7 @@ export const useChatStore = create<ChatState>()(
         if (get().sendingSessionId || !rawText.trim()) return
         const text = rawText.trim()
         const requestId = createRequestId()
+        const effectiveSkillIds = skillIds?.length ? dedupeSkillIds(text, skillIds) : []
         const message: ChatMessage = {
           id: requestId,
           role: 'user',
@@ -276,9 +282,10 @@ export const useChatStore = create<ChatState>()(
           createdAt: new Date().toISOString(),
           requestId,
           status: 'pending',
+          ...(effectiveSkillIds.length ? { skillIds: effectiveSkillIds } : {}),
         }
         replaceMessages(sessionId, [...messagesFor(get(), sessionId), message])
-        await runRequest(requestId, sessionId, userId, requestId, text, skillIds)
+        await runRequest(requestId, sessionId, userId, requestId, text, effectiveSkillIds)
       },
       retry: async (messageId, sessionId, userId) => {
         if (get().sendingSessionId) return
@@ -292,9 +299,9 @@ export const useChatStore = create<ChatState>()(
             item.id === messageId ? { ...item, status: 'pending', error: undefined } : item,
           ),
         )
-        await runRequest(messageId, sessionId, userId, requestId, message.content)
+        await runRequest(messageId, sessionId, userId, requestId, message.content, message.skillIds)
       },
-      editAndResend: async (messageId, rawText, sessionId, userId) => {
+      editAndResend: async (messageId, rawText, sessionId, userId, skillIds) => {
         if (get().sendingSessionId || !rawText.trim()) return
         const original = messagesFor(get(), sessionId).find((item) => item.id === messageId)
         if (!original || original.role !== 'user' || original.status !== 'error') return
@@ -303,6 +310,9 @@ export const useChatStore = create<ChatState>()(
         const previousRequestId = original.requestId ?? original.id
         const requestId = text === original.content ? previousRequestId : createRequestId()
         dropStreamArtifacts(sessionId, [previousRequestId, requestId])
+        const effectiveSkillIds = skillIds !== undefined
+          ? dedupeSkillIds(text, skillIds)
+          : (original.skillIds ?? [])
 
         const messages = messagesFor(get(), sessionId)
         const index = messages.findIndex((item) => item.id === messageId)
@@ -316,9 +326,10 @@ export const useChatStore = create<ChatState>()(
           retryable: undefined,
           interrupted: undefined,
           createdAt: new Date().toISOString(),
+          skillIds: effectiveSkillIds.length ? effectiveSkillIds : undefined,
         }
         replaceMessages(sessionId, [...messages.slice(0, index), edited])
-        await runRequest(requestId, sessionId, userId, requestId, text)
+        await runRequest(requestId, sessionId, userId, requestId, text, effectiveSkillIds)
       },
       stop: () => {
         const { sendingSessionId } = get()

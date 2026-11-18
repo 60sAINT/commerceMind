@@ -1,23 +1,26 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, ArrowDown, RefreshCw } from 'lucide-react'
 
-import { Composer } from '@/components/chat/Composer'
+import { Composer, MAX_SKILLS } from '@/components/chat/Composer'
 import { EmptyState } from '@/components/chat/EmptyState'
 import { MessageItem } from '@/components/chat/MessageItem'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { TopBar } from '@/components/layout/TopBar'
 import { SettingsPanel } from '@/components/panels/SettingsPanel'
 import { SkillsPanel } from '@/components/panels/SkillsPanel'
+import { MemoryPanel } from '@/components/panels/MemoryPanel'
 import { useSmartScroll } from '@/hooks/useSmartScroll'
 import { healthProblems, useHealthStore } from '@/stores/health'
 import { useChatStore, type ChatMessage } from '@/stores/chat'
 import { useHistoryStore } from '@/stores/history'
 import { useSessionStore } from '@/stores/session'
+import { useSkillsStore } from '@/stores/skills'
+import type { SkillSummary } from '@/types/api'
 
 /** 稳定引用，避免 messagesBySession 缺省时每次渲染都生成新数组。 */
 const EMPTY_MESSAGES: ChatMessage[] = []
 
-type Panel = 'skills' | 'settings' | null
+type Panel = 'skills' | 'settings' | 'memory' | null
 
 function ThinkingRow({ onStop }: { onStop: () => void }) {
   return (
@@ -67,7 +70,15 @@ export default function App() {
   const checkHealth = useHealthStore((state) => state.check)
   const problems = useMemo(() => healthProblems(health), [health])
 
+  const skillsData = useSkillsStore((state) => state.data)
+  const skillsLoading = useSkillsStore((state) => state.loading)
+  const skillsError = useSkillsStore((state) => state.error)
+  const loadSkills = useSkillsStore((state) => state.load)
+  const skills = useMemo(() => skillsData?.skills ?? [], [skillsData])
+  const skillsEnabled = skillsData?.enabled ?? false
+
   const [draft, setDraft] = useState('')
+  const [selectedSkills, setSelectedSkills] = useState<SkillSummary[]>([])
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [panel, setPanel] = useState<Panel>(null)
@@ -94,6 +105,11 @@ export default function App() {
     }
   }, [checkHealth])
 
+  // 技能目录供输入框的 `/` 菜单和技能面板共用。
+  useEffect(() => {
+    void loadSkills()
+  }, [loadSkills])
+
   useEffect(() => {
     if (sendingSessionId === null) void useHistoryStore.getState().loadSessions(userId)
   }, [userId, sendingSessionId])
@@ -115,6 +131,7 @@ export default function App() {
       if (event.key !== 'Escape') return
       setEditingMessageId(null)
       setDraft('')
+      setSelectedSkills([])
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
@@ -127,6 +144,7 @@ export default function App() {
       cancelForSessionSwitch()
       setEditingMessageId(null)
       setDraft('')
+      setSelectedSkills([])
       setSessionId(id)
     },
     [cancelForSessionSwitch, sessionId, setSessionId],
@@ -136,6 +154,7 @@ export default function App() {
     setSidebarOpen(false)
     setEditingMessageId(null)
     setDraft('')
+    setSelectedSkills([])
     void history.create(userId)
   }, [history, userId])
 
@@ -143,16 +162,35 @@ export default function App() {
     (id: string) => {
       setEditingMessageId(null)
       setDraft('')
+      setSelectedSkills([])
       void history.remove(userId, id)
     },
     [history, userId],
   )
 
-  const beginEdit = useCallback((message: ChatMessage) => {
-    setEditingMessageId(message.id)
-    setDraft(message.content)
-    requestAnimationFrame(() => document.getElementById('composer-input')?.focus())
-  }, [])
+  const beginEdit = useCallback(
+    (message: ChatMessage) => {
+      setEditingMessageId(message.id)
+      setDraft(message.content)
+      const ids = message.skillIds ?? []
+      setSelectedSkills(
+        ids.map(
+          (id) =>
+            skills.find((skill) => skill.id === id) ?? {
+              id,
+              name: id,
+              description: '',
+              keywords: [],
+              version: '',
+              enabled: true,
+              path: '',
+            },
+        ),
+      )
+      requestAnimationFrame(() => document.getElementById('composer-input')?.focus())
+    },
+    [skills],
+  )
 
   const handleRetry = useCallback(
     (messageId: string) => {
@@ -167,6 +205,7 @@ export default function App() {
       cancelForSessionSwitch()
       setEditingMessageId(null)
       setDraft('')
+      setSelectedSkills([])
       setSessionId('')
       setUserId(next)
       setPanel(null)
@@ -174,11 +213,37 @@ export default function App() {
     [cancelForSessionSwitch, setSessionId, setUserId, userId],
   )
 
+  const changeSessionId = useCallback(
+    (next: string) => {
+      const trimmed = next.trim()
+      if (trimmed === sessionId) return
+      cancelForSessionSwitch()
+      setEditingMessageId(null)
+      setDraft('')
+      setSelectedSkills([])
+      setSessionId(trimmed)
+      setPanel(null)
+    },
+    [cancelForSessionSwitch, sessionId, setSessionId],
+  )
+
+  const selectSkill = useCallback((skill: SkillSummary) => {
+    setSelectedSkills((current) => {
+      if (current.length >= MAX_SKILLS) return current
+      if (current.some((item) => item.id === skill.id)) return current
+      return [...current, skill]
+    })
+  }, [])
+
+  const removeSkill = useCallback((skillId: string) => {
+    setSelectedSkills((current) => current.filter((item) => item.id !== skillId))
+  }, [])
+
   const blocked =
     !historyReady || history.busy || history.loading || history.loadingMessages
 
   const sendText = useCallback(
-    async (text: string) => {
+    async (text: string, skillIds?: string[]) => {
       const trimmed = text.trim()
       if (!trimmed || sending || blocked) return
       let targetSessionId = sessionId
@@ -187,7 +252,7 @@ export default function App() {
         targetSessionId = useSessionStore.getState().sessionId
         if (!targetSessionId || useSessionStore.getState().userId !== userId) return
       }
-      void send(trimmed, targetSessionId, userId)
+      void send(trimmed, targetSessionId, userId, skillIds)
     },
     [blocked, history, send, sending, sessionId, userId],
   )
@@ -195,23 +260,39 @@ export default function App() {
   const submit = useCallback(() => {
     const text = draft.trim()
     if (!text || blocked || sending) return
-    setDraft('')
+    const skillIds = selectedSkills.map((skill) => skill.id)
     if (editingMessageId) {
       if (!sessionId) return
-      void editAndResend(editingMessageId, text, sessionId, userId)
+      setDraft('')
+      setSelectedSkills([])
+      void editAndResend(editingMessageId, text, sessionId, userId, skillIds)
       setEditingMessageId(null)
       return
     }
-    void sendText(text)
-  }, [blocked, draft, editAndResend, editingMessageId, sendText, sending, sessionId, userId])
+    setDraft('')
+    setSelectedSkills([])
+    void sendText(text, skillIds)
+  }, [
+    blocked,
+    draft,
+    editAndResend,
+    editingMessageId,
+    selectedSkills,
+    sendText,
+    sending,
+    sessionId,
+    userId,
+  ])
 
   const askQuickQuestion = useCallback(
     (question: string) => {
+      const skillIds = selectedSkills.map((skill) => skill.id)
       setDraft('')
       setEditingMessageId(null)
-      void sendText(question)
+      setSelectedSkills([])
+      void sendText(question, skillIds)
     },
-    [sendText],
+    [selectedSkills, sendText],
   )
 
   const firstUserMessage = messages.find((message) => message.role === 'user')
@@ -379,6 +460,14 @@ export default function App() {
             sending={sending}
             disabled={blocked}
             editing={Boolean(editingMessageId)}
+            skills={skills}
+            skillsLoading={skillsLoading}
+            skillsError={skillsError}
+            skillsEnabled={skillsEnabled}
+            selectedSkills={selectedSkills}
+            onSelectSkill={selectSkill}
+            onRemoveSkill={removeSkill}
+            maxSkills={MAX_SKILLS}
           />
         </div>
       </main>
@@ -391,7 +480,19 @@ export default function App() {
           open
           onClose={() => setPanel(null)}
           userId={userId}
+          sessionId={sessionId}
           onChangeUserId={changeUserId}
+          onChangeSessionId={changeSessionId}
+          onOpenMemory={() => setPanel('memory')}
+        />
+      )}
+      {panel === 'memory' && (
+        <MemoryPanel
+          key={sessionId}
+          open
+          onClose={() => setPanel(null)}
+          sessionId={sessionId}
+          userId={userId}
         />
       )}
     </div>

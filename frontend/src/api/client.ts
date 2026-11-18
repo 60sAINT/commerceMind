@@ -1,12 +1,22 @@
 import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
 
+import { useSessionStore } from '@/stores/session'
 import { ApiError, resolveErrorMessage } from './errors'
 
 /**
  * 默认走 /api，由 Vite 开发代理或生产同源反向代理转发到 FastAPI。
  * 后端目前没有配置 CORS，因此不要在浏览器里直连 127.0.0.1:8000。
  */
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api').replace(/\/+$/, '')
+export const DEFAULT_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '')
+
+/** 兼容旧引用；实际请求请用 getApiBaseUrl()，它会读取设置里的动态地址。 */
+export const API_BASE_URL = DEFAULT_API_BASE_URL
+
+/** 当前生效的 API 前缀；设置面板修改后立即用于后续 JSON 与 SSE 请求。 */
+export function getApiBaseUrl(): string {
+  const configured = useSessionStore.getState().baseUrl.trim()
+  return (configured || DEFAULT_API_BASE_URL).replace(/\/+$/, '')
+}
 
 /** 后端 /chat 的硬超时是 50s，这里留出网络与排队余量。 */
 export const DEFAULT_TIMEOUT_MS = 60_000
@@ -112,6 +122,7 @@ export async function requestJson<T>(path: string, options: RequestOptions = {})
 
   try {
     const response = await http.request<T>({
+      baseURL: getApiBaseUrl(),
       url: path,
       method,
       data: body,

@@ -1,9 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, RefreshCw, Sparkles } from 'lucide-react'
+import { useCallback, useEffect } from 'react'
+import { AlertTriangle, Clock3, RefreshCw, Sparkles } from 'lucide-react'
 
-import { isApiError } from '@/api'
-import { getSkills, reloadSkills } from '@/services'
-import type { SkillsResponse } from '@/types/api'
+import { useSkillsStore } from '@/stores/skills'
 import { Sheet } from '@/components/ui/Sheet'
 
 interface SkillsPanelProps {
@@ -11,67 +9,32 @@ interface SkillsPanelProps {
   onClose: () => void
 }
 
-function errorText(error: unknown): string {
-  if (isApiError(error)) return error.message
-  return error instanceof Error ? error.message : '加载技能失败'
+function formatLoadedAt(value: string): string {
+  if (!value) return '未知'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', { hour12: false })
 }
 
 export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
-  const [data, setData] = useState<SkillsResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [reloading, setReloading] = useState(false)
-  const [reloadMessage, setReloadMessage] = useState<string | null>(null)
-
-  const load = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const next = await getSkills({ signal })
-      if (signal?.aborted) return
-      setData(next)
-      setError(null)
-    } catch (caught) {
-      if (signal?.aborted) return
-      setError(errorText(caught))
-    } finally {
-      if (!signal?.aborted) setLoading(false)
-    }
-  }, [])
+  const data = useSkillsStore((state) => state.data)
+  const loading = useSkillsStore((state) => state.loading)
+  const error = useSkillsStore((state) => state.error)
+  const reloading = useSkillsStore((state) => state.reloading)
+  const reloadMessage = useSkillsStore((state) => state.reloadMessage)
+  const load = useSkillsStore((state) => state.load)
+  const reload = useSkillsStore((state) => state.reload)
+  const clearReloadMessage = useSkillsStore((state) => state.clearReloadMessage)
 
   useEffect(() => {
     if (!open) return
-    const controller = new AbortController()
-    getSkills({ signal: controller.signal })
-      .then((next) => {
-        if (controller.signal.aborted) return
-        setData(next)
-        setError(null)
-      })
-      .catch((caught) => {
-        if (!controller.signal.aborted) setError(errorText(caught))
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false)
-      })
-    return () => controller.abort()
-  }, [open])
+    clearReloadMessage()
+    void load(true)
+  }, [clearReloadMessage, load, open])
 
-  const reload = useCallback(async () => {
-    setReloading(true)
-    setReloadMessage(null)
-    try {
-      const report = await reloadSkills()
-      setReloadMessage(`已重新加载：新增 ${report.added.length} · 更新 ${report.updated.length} · 移除 ${report.removed.length}`)
-      await load()
-    } catch (caught) {
-      setReloadMessage(
-        isApiError(caught) && caught.status === 404
-          ? '当前后端未开启技能热重载（需要 skills.enabled 与 skills.debug）'
-          : errorText(caught),
-      )
-    } finally {
-      setReloading(false)
-    }
-  }, [load])
+  const handleReload = useCallback(() => {
+    void reload()
+  }, [reload])
 
   return (
     <Sheet
@@ -95,7 +58,7 @@ export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
         </div>
         <button
           type="button"
-          onClick={() => void reload()}
+          onClick={handleReload}
           disabled={reloading || loading}
           className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[11px] text-muted transition-colors hover:bg-hover hover:text-ink disabled:opacity-50"
         >
@@ -103,6 +66,26 @@ export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
           重新加载
         </button>
       </div>
+
+      {data && (
+        <dl className="mt-3 grid grid-cols-2 gap-2 rounded-lg border border-line bg-soft px-3 py-2 text-[10px] text-muted">
+          <div className="min-w-0">
+            <dt className="text-faint">目录版本</dt>
+            <dd className="mt-0.5 font-mono text-[11px] text-ink">
+              {data.version > 0 ? `v${data.version}` : '—'}
+            </dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="inline-flex items-center gap-1 text-faint">
+              <Clock3 className="size-3" />
+              加载时间
+            </dt>
+            <dd className="mt-0.5 truncate text-[11px] text-ink" title={data.loaded_at}>
+              {formatLoadedAt(data.loaded_at)}
+            </dd>
+          </div>
+        </dl>
+      )}
 
       {reloadMessage && (
         <p className="mt-3 rounded-md border border-line bg-soft px-3 py-2 text-[11px] leading-5 text-muted">
@@ -142,7 +125,7 @@ export function SkillsPanel({ open, onClose }: SkillsPanelProps) {
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="truncate text-xs font-medium">{skill.name}</p>
-                  <p className="mt-0.5 font-mono text-[10px] text-faint">{skill.id}</p>
+                  <p className="mt-0.5 font-mono text-[10px] text-faint">/{skill.id}</p>
                 </div>
                 <span
                   className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${

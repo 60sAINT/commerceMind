@@ -29,11 +29,14 @@ export const useSessionStore = create<SessionState>()(
     (set) => ({
       userId: 'customer-001',
       sessionId: '',
-      baseUrl: import.meta.env.VITE_API_BASE_URL ?? '/api',
+      baseUrl: import.meta.env.VITE_API_BASE_URL || '/api',
       theme: initialTheme(),
       setUserId: (userId) => set({ userId }),
       setSessionId: (sessionId) => set({ sessionId }),
-      setBaseUrl: (baseUrl) => set({ baseUrl: baseUrl.trim() || '/api' }),
+      setBaseUrl: (baseUrl) => {
+        const next = baseUrl.trim().replace(/\/+$/, '')
+        set({ baseUrl: next || '/api' })
+      },
       setTheme: (theme) => set({ theme }),
     }),
     { name: 'commercemind.session', storage: createJSONStorage(() => localStorage) },

@@ -18,8 +18,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   conversation_lease_lost: '会话处理已中断，请重试',
   skill_not_found: '所选技能不存在，请刷新技能列表',
   skill_unavailable: '技能内容不可用，请在技能面板重新加载',
-  too_many_skills: '选择的技能数量超过限制',
-  skill_message_required: '选择技能后还需要输入问题',
+  too_many_skills: '最多选择 3 个技能，请先移除多余的技能',
+  skill_message_required: '选择技能后还需要输入问题，请在 /技能名 后补充具体问题',
   internal_error: '服务内部错误，请稍后重试',
 
   // LLM 上游

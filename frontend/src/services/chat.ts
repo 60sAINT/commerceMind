@@ -1,4 +1,4 @@
-import { ApiError, API_BASE_URL } from '@/api'
+import { ApiError, getApiBaseUrl, resolveErrorMessage } from '@/api'
 import type { ChatRequest, ChatResponse } from '@/types/api'
 
 interface ChatOptions {
@@ -15,10 +15,11 @@ export interface StreamHandlers {
 function apiError(response: Response, payload: unknown): ApiError {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
   const code = typeof data.error_code === 'string' ? data.error_code : `http_${response.status}`
+  const detail = typeof data.detail === 'string' ? data.detail : undefined
   return new ApiError({
     status: response.status,
     code,
-    message: typeof data.detail === 'string' ? data.detail : undefined,
+    message: resolveErrorMessage(code, response.status, detail),
     requestId: typeof data.request_id === 'string' ? data.request_id : null,
     body: payload,
   })
@@ -29,7 +30,7 @@ export async function streamChat(
   handlers: StreamHandlers,
   options: ChatOptions = {},
 ): Promise<ChatResponse> {
-  const response = await fetch(`${API_BASE_URL}/chat/stream`, {
+  const response = await fetch(`${getApiBaseUrl()}/chat/stream`, {
     method: 'POST',
     headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
