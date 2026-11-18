@@ -9,7 +9,7 @@ CommerceMind 是面向电商客服场景的多 Agent 应用，提供通用咨询
 项目正在按功能块逐 commit 实现，当前阶段在仓库骨架上增加了最小 LLM 对话链路：
 
 - [x] 仓库骨架、依赖清单、环境变量模板、测试配置
-- [x] 最小 LLM 对话链路（`/health`、`/chat`）
+- [x] 最小 LLM 对话链路（`/health`、`/chat/stream`）
 - [x] 最小 Docker 镜像（只启动 app）
 - [x] Redis / ChromaDB 本地编排与健康检查
 - [ ] 基础工具、鉴权与会话并发控制
@@ -44,12 +44,12 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-## 对话链路（含短期记忆）
+## 对话链路（SSE + 短期记忆）
 
 当前实现一条纵向切片：
 
 ```text
-POST /chat -> 读 Redis working memory -> LLM 调用 -> 原子提交本轮 -> 返回 JSON
+POST /chat/stream -> 读 Redis working memory -> 流式 LLM 调用 -> 原子提交本轮 -> SSE 事件
 ```
 
 接口：
@@ -60,15 +60,26 @@ GET /health
     "memory": {"enabled": true, "redis": "ok", "chroma": "ok", "detail": null},
     "detail": null}
 
-POST /chat
+POST /chat/stream
 {"message": "退款一般多久到账？", "user_id": "u1", "session_id": "c1", "client_request_id": "r1"}
--> {"request_id": "5f2c...", "session_id": "c1", "response": "...",
-    "latency_ms": 123.4, "input_tokens": 12, "output_tokens": 8}
+
+event: meta
+data: {"request_id": "5f2c...", "session_id": "c1"}
+
+event: delta
+data: {"text": "退款一般"}
+
+event: delta
+data: {"text": " 3-5 个工作日到账。"}
+
+event: done
+data: {"request_id": "5f2c...", "session_id": "c1", "response": "退款一般 3-5 个工作日到账。"}
 ```
 
-- `session_id` 可省略，服务端生成并在响应中返回；后续轮次带同一个 `session_id` 才能续接记忆。
+- `session_id` 可省略，服务端生成并在 `meta` / `done` 中返回；后续轮次带同一个 `session_id` 才能续接记忆。
 - `client_request_id` 可省略；同 ID、同消息直接回放上次结果，同 ID 不同消息返回 409。
   重试时即使不带 `session_id`，也会按用户级回执回到原会话。
+- 生成阶段失败通过 `event: error` 返回（HTTP 仍为 200）；参数校验、模型未配置等前置错误仍是普通 JSON 4xx/5xx。
 - Redis/Chroma 不可用时按无记忆模式继续回答，`/health` 显示 `degraded`；
   `COMMERCEMIND_MEMORY_REQUIRED=true` 时启动直接失败。
 
@@ -95,7 +106,7 @@ COMMERCEMIND_LLM_TIMEOUT_S=15
 COMMERCEMIND_LLM_MAX_TOKENS=1024
 ```
 
-没有配置 Key 时服务仍可启动，`/health` 会返回 `model_configured: false`，`/chat` 返回 503。
+没有配置 Key 时服务仍可启动，`/health` 会返回 `model_configured: false`，`/chat/stream` 返回 503。
 
 ### 2. 启动服务
 
@@ -117,24 +128,25 @@ uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
 # 健康检查：确认模型是否已配置
 curl -s http://127.0.0.1:8000/health | python -m json.tool
 
-# 真实对话
-curl -i -X POST http://127.0.0.1:8000/chat \
+# 真实对话（SSE，-N 关闭 curl 缓冲）
+curl -N -i -X POST http://127.0.0.1:8000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message": "退款一般多久到账？"}'
 ```
 
-成功响应会带 `X-Request-ID` 响应头，响应体包含 `request_id`、`response` 和 `latency_ms`。
+成功时先收到 `meta`，随后是若干 `delta`，最后是 `done`；`done.response` 是本轮完整回答。
+生成阶段失败会收到 `event: error`，其中包含 `error_code` 和 `detail`。
 
 常见错误：
 
-| 场景 | 状态码 | `error_code` |
-|---|---|---|
-| 未配置 `ANTHROPIC_API_KEY` | 503 | `model_not_configured` |
-| 消息为空或只有空格 | 422 | FastAPI 默认校验错误 |
-| 模型超时 | 503 | `llm_timeout` |
-| Key / Base URL 鉴权失败 | 502 | `llm_auth_failed` |
-| 模型或接口地址不存在 | 502 | `llm_not_found` |
-| 模型返回空内容 | 502 | `llm_empty_response` |
+| 场景 | 传输方式 | 状态码 | `error_code` |
+|---|---|---|---|
+| 未配置 `ANTHROPIC_API_KEY` | JSON | 503 | `model_not_configured` |
+| 消息为空或只有空格 | JSON | 422 | FastAPI 默认校验错误 |
+| 模型超时 | SSE `error` | 200 | `llm_timeout` |
+| Key / Base URL 鉴权失败 | SSE `error` | 200 | `llm_auth_failed` |
+| 模型或接口地址不存在 | SSE `error` | 200 | `llm_not_found` |
+| 模型返回空内容 | SSE `error` | 200 | `llm_empty_response` |
 
 服务日志只记录 `request_id`、消息长度、耗时和错误类型，不记录 Key 和用户原文。
 
@@ -187,7 +199,7 @@ pytest -q
 - `redis`：短期记忆，宿主机 `6379`，AOF 持久化
 - `chromadb`：长期记忆，宿主机 `8001`，数据卷持久化
 
-`/chat` 已接入 Redis 短期记忆；Chroma 目前只参与 `/health` 检查，长期记忆检索尚未接入。app 默认不强制依赖 Redis/Chroma，由 `COMMERCEMIND_MEMORY_REQUIRED` 控制是否允许降级启动。Nginx 和 Prometheus 仍未编排。
+`/chat/stream` 已接入 Redis 短期记忆；Chroma 目前只参与 `/health` 检查，长期记忆检索尚未接入。app 默认不强制依赖 Redis/Chroma，由 `COMMERCEMIND_MEMORY_REQUIRED` 控制是否允许降级启动。Nginx 和 Prometheus 仍未编排。
 
 ### 构建并启动
 
@@ -231,7 +243,7 @@ CHROMA_PORT=8001
 
 ```bash
 curl -s http://127.0.0.1:8000/health | python -m json.tool
-curl -i -X POST http://127.0.0.1:8000/chat \
+curl -N -i -X POST http://127.0.0.1:8000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message": "退款一般多久到账？"}'
 ```
@@ -246,7 +258,7 @@ docker compose exec redis redis-cli -a "$REDIS_PASSWORD" ping
 curl -s http://127.0.0.1:8001/api/v1/heartbeat
 ```
 
-没有配置 `ANTHROPIC_API_KEY` 时，`/health` 返回 `degraded`，`/chat` 返回 503，但容器可以正常启动。
+没有配置 `ANTHROPIC_API_KEY` 时，`/health` 返回 `degraded`，`/chat/stream` 返回 503，但容器可以正常启动。
 
 ### 常用命令
 
@@ -285,23 +297,23 @@ docker compose up -d --force-recreate commercemind
 名称和描述用于模型选择；keywords 不参与选择，也不注入模型目录。
 `references/`、`templates/`、`scripts/` 保存按需资源；脚本不会自动执行。
 
-- Skills 开启后，`/chat` 的 system 始终包含轻量目录（id、名称、描述），包括无记忆、有记忆及记忆读取失败的路径。
+- Skills 开启后，`/chat/stream` 的 system 始终包含轻量目录（id、名称、描述），包括无记忆、有记忆及记忆读取失败的路径。
 - 不传 `skill_ids` 或传 `null`，且消息没有手动命令时，先调用模型根据 description 做语义选择。选择阶段只看到名称、描述和 id，不读取正文或资源。只有通过校验的选中 id 才会触发正文加载。
 - 手动选择有两种方式：消息开头输入 `/billing_support 问题内容`；或请求传 `skill_ids`。二者合并去重并跳过自动选择。支持 `/billing_support /technical_support 问题内容`。
 - 显式传 `skill_ids: []` 可关闭本轮自动选择（消息有 slash 命令时仍执行手动选择）。
 - 每轮重新选技，不把选中状态永久绑定到会话。正文按需加载并缓存，加入 system 时保留原有系统角色和记忆上下文；不读取包内资源内容。
 - 自动选择最多额外调用一次模型，最多等待 8 秒；未匹配、超时、调用失败或返回非法/越界 id 时不加载正文，继续普通回答。选择目录 JSON 受目录预算限制，放不下的条目跳过；完整目录可通过 GET 获取并手动选择。
-- 当前仓库只有后端；前端输入 `/` 时可调用 `GET /skills` 获取候选项，选中后发送 `/skill_id 问题内容` 或 `skill_ids`。尚无前端弹出菜单组件。单独发送 `/billing_support` 返回 `422 skill_message_required`，需附带问题。
+- 前端在 `frontend/`，已有 Chat 界面和只读技能面板；输入 `/` 的候选菜单尚未实现。后续可调用 `GET /skills` 获取候选项，选中后发送 `/skill_id 问题内容` 或 `skill_ids`。单独发送 `/billing_support` 返回 `422 skill_message_required`，需附带问题。
 - 原始消息保留在记忆与幂等回执中；发给本轮回答模型的问题去除开头的 Skill 命令。
 - Skills 关闭时，不创建管理器，不注入目录或正文，忽略 `skill_ids`，原有模型调用与记忆行为保持不变。
 
 ```bash
 curl http://localhost:8000/skills
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message":"退款一般多久到账？"}'
 # 手动选择（跳过自动选择模型调用）
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message":"/billing_support 退款一般多久到账？"}'
 ```

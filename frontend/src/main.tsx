@@ -5,6 +5,7 @@ import './styles/index.css'
 import './styles/tokens.less'
 import './styles/base.less'
 import './styles/animations.less'
+import './styles/markdown.less'
 
 import App from './App'
 

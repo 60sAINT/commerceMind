@@ -224,9 +224,21 @@ async function runRequest(
     if (state.activeRequestId !== requestId || state.sendingSessionId !== activeSessionId) return
     if (controller.signal.aborted) return
     const apiError = isApiError(error) ? error : null
-    replaceMessages(
-      activeSessionId,
-      messagesFor(state, activeSessionId).map((message) =>
+    const next: ChatMessage[] = []
+    for (const message of messagesFor(state, activeSessionId)) {
+      // 失败时同样收尾流式占位：有内容就保留为展示片段，没内容就丢弃。
+      if (message.id === `stream-${requestId}`) {
+        if (message.content.trim()) {
+          next.push({
+            ...message,
+            id: `${PARTIAL_PREFIX}${requestId}`,
+            status: undefined,
+            interrupted: true,
+          })
+        }
+        continue
+      }
+      next.push(
         message.id === messageId
           ? {
               ...message,
@@ -235,8 +247,9 @@ async function runRequest(
               retryable: apiError?.retryable ?? true,
             }
           : message,
-      ),
-    )
+      )
+    }
+    replaceMessages(activeSessionId, next)
   } finally {
     const state = useChatStore.getState()
     if (state.activeRequestId === requestId) {

@@ -26,6 +26,38 @@
   }
 }
 
+@keyframes cm-slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes cm-slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes cm-caret {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .cm-spin {
   animation: cm-spin 1s linear infinite;
 }
@@ -36,4 +68,42 @@
 
 .cm-fade-up {
   animation: cm-fade-up 0.35s ease-out both;
+}
+
+.cm-slide-in-right {
+  animation: cm-slide-in-right 0.22s ease-out both;
+}
+
+.cm-slide-in-left {
+  animation: cm-slide-in-left 0.22s ease-out both;
+}
+
+// 流式输出末尾的光标；只做透明度变化，避免布局抖动。
+.cm-caret {
+  display: inline-block;
+  width: 0.45rem;
+  height: 1rem;
+  margin-left: 2px;
+  vertical-align: -0.15rem;
+  border-radius: 1px;
+  background: var(--cm-ink);
+  animation: cm-caret 1s steps(2, start) infinite;
+}
+
+// 三点“思考中”动画，使用 nth-child 制造错峰。
+.cm-dot {
+  display: inline-block;
+  width: 0.3rem;
+  height: 0.3rem;
+  border-radius: 999px;
+  background: currentColor;
+  animation: cm-breathe 1.2s ease-in-out infinite;
+
+  &:nth-child(2) {
+    animation-delay: 0.16s;
+  }
+
+  &:nth-child(3) {
+    animation-delay: 0.32s;
+  }
 }

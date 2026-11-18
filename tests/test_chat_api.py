@@ -11,6 +11,7 @@ import pytest
 from api.main import create_app
 from core.config import Settings
 from core.llm import ChatResult, LLMClient, LLMError, extract_text_content
+from sse_helpers import chat_stream
 
 MODEL = "test-model"
 
@@ -42,6 +43,8 @@ class FakeLLM:
     async def stream_chat(self, message: str, *, history=None, system=None):
         self.last_message = message
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         split = max(1, len(self.text) // 2)
         for chunk in (self.text[:split], self.text[split:]):
             await asyncio.sleep(0)
@@ -96,29 +99,23 @@ async def test_health_reports_configured_model():
 
 
 @pytest.mark.asyncio
-async def test_chat_returns_model_text_and_latency():
+async def test_chat_stream_returns_model_text_and_request_id():
     app = make_app()
     fake = FakeLLM("退款一般 3-5 个工作日到账。")
     app.state.llm = fake
 
-    response = await send(
-        app,
-        "POST",
-        "/chat",
-        json={"message": "  退款一般多久到账？  "},
-    )
+    result = await chat_stream(app, {"message": "  退款一般多久到账？  "})
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["response"] == "退款一般 3-5 个工作日到账。"
-    assert body["latency_ms"] >= 0
-    assert body["request_id"]
-    assert response.headers["x-request-id"] == body["request_id"]
+    assert result.status_code == 200
+    assert result.text == "退款一般 3-5 个工作日到账。"
+    assert result.done["response"] == "退款一般 3-5 个工作日到账。"
+    assert result.request_id
+    assert result.meta["request_id"] == result.request_id
     assert fake.last_message == "退款一般多久到账？"
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_emits_sse_events_without_changing_legacy_chat():
+async def test_chat_stream_emits_sse_events():
     app = make_app()
     fake = FakeLLM("流式回答")
     app.state.llm = fake
@@ -137,94 +134,96 @@ async def test_chat_stream_emits_sse_events_without_changing_legacy_chat():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("message", ["", "   "])
-async def test_chat_rejects_empty_message(message):
+async def test_chat_stream_rejects_empty_message(message):
     app = make_app()
 
-    response = await send(app, "POST", "/chat", json={"message": message})
+    response = await send(app, "POST", "/chat/stream", json={"message": message})
 
     assert response.status_code == 422
 
 
 @pytest.mark.asyncio
-async def test_chat_requires_configured_key():
+async def test_chat_stream_requires_configured_key():
     app = make_app(api_key="")
-    response = await send(app, "POST", "/chat", json={"message": "你好"})
+    response = await send(app, "POST", "/chat/stream", json={"message": "你好"})
 
     assert response.status_code == 503
     body = response.json()
     assert body["error_code"] == "model_not_configured"
-    assert body["request_id"]
+    assert body["request_id"] == ""
 
 
 @pytest.mark.asyncio
-async def test_chat_maps_llm_error_without_leaking_exception():
+async def test_chat_stream_maps_llm_error_without_leaking_exception():
     app = make_app()
     app.state.llm = FakeLLM(
         error=LLMError("模型响应超时，请稍后重试", status_code=503, code="llm_timeout")
     )
 
-    response = await send(app, "POST", "/chat", json={"message": "你好"})
+    result = await chat_stream(app, {"message": "你好"})
 
-    assert response.status_code == 503
-    body = response.json()
-    assert body["error_code"] == "llm_timeout"
-    assert body["detail"] == "模型响应超时，请稍后重试"
-    assert "Traceback" not in response.text
+    assert result.status_code == 200
+    assert result.error is not None
+    assert result.error["error_code"] == "llm_timeout"
+    assert result.error["detail"] == "模型响应超时，请稍后重试"
+    assert "Traceback" not in result.response.text
 
 
 @pytest.mark.asyncio
-async def test_llm_timeout_is_mapped_to_503():
+async def test_llm_timeout_is_streamed_as_error_event():
     app = make_app()
     assert isinstance(app.state.llm, LLMClient)
     request = httpx.Request("POST", "https://api.test/v1/messages")
 
-    async def fake_create(**kwargs):
+    def fake_stream(**kwargs):
         raise anthropic.APITimeoutError(request=request)
 
-    app.state.llm._client.messages.create = fake_create
+    app.state.llm._client.messages.stream = fake_stream
 
-    response = await send(app, "POST", "/chat", json={"message": "你好"})
+    result = await chat_stream(app, {"message": "你好"})
 
-    assert response.status_code == 503
-    body = response.json()
-    assert body["error_code"] == "llm_timeout"
-    assert "超时" in body["detail"]
+    assert result.status_code == 200
+    assert result.error is not None
+    assert result.error["error_code"] == "llm_timeout"
+    assert "超时" in result.error["detail"]
 
 
 @pytest.mark.asyncio
-async def test_llm_auth_failure_is_mapped_to_502():
+async def test_llm_auth_failure_is_streamed_as_error_event():
     app = make_app()
     request = httpx.Request("POST", "https://api.test/v1/messages")
 
-    async def fake_create(**kwargs):
+    def fake_stream(**kwargs):
         raise anthropic.AuthenticationError(
             "invalid api key",
             response=httpx.Response(401, request=request),
             body=None,
         )
 
-    app.state.llm._client.messages.create = fake_create
+    app.state.llm._client.messages.stream = fake_stream
 
-    response = await send(app, "POST", "/chat", json={"message": "你好"})
+    result = await chat_stream(app, {"message": "你好"})
 
-    assert response.status_code == 502
-    body = response.json()
-    assert body["error_code"] == "llm_auth_failed"
-    assert "鉴权失败" in body["detail"]
-    assert "invalid api key" not in response.text
+    assert result.status_code == 200
+    assert result.error is not None
+    assert result.error["error_code"] == "llm_auth_failed"
+    assert "鉴权失败" in result.error["detail"]
+    assert "invalid api key" not in result.response.text
 
 
 @pytest.mark.asyncio
-async def test_logs_contain_request_id_but_not_user_message(caplog):
+async def test_stream_logs_contain_request_id_but_not_user_message(caplog):
     caplog.set_level(logging.INFO, logger="commercemind.api")
     app = make_app()
-    app.state.llm = FakeLLM("已收到。")
+    app.state.llm = FakeLLM(error=RuntimeError("boom"))
 
     private_message = "我的手机号 13800138000，退款多久到账？"
-    response = await send(app, "POST", "/chat", json={"message": private_message})
+    result = await chat_stream(app, {"message": private_message})
 
-    assert response.status_code == 200
-    assert response.json()["request_id"] in caplog.text
+    assert result.status_code == 200
+    assert result.error is not None
+    assert result.error["error_code"] == "internal_error"
+    assert result.request_id in caplog.text
     assert "13800138000" not in caplog.text
     assert "退款多久到账" not in caplog.text
 

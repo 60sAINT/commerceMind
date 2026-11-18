@@ -1,0 +1,240 @@
+// 助手消息的 Markdown 排版与代码高亮。
+// Tailwind preflight 会重置列表等元素，这里按阅读场景显式恢复。
+.cm-markdown {
+  font-size: 0.875rem;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+
+  > :first-child {
+    margin-top: 0;
+  }
+
+  > :last-child {
+    margin-bottom: 0;
+  }
+
+  p {
+    margin: 0.55rem 0;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    margin: 1.2rem 0 0.5rem;
+    font-weight: 600;
+    line-height: 1.35;
+    letter-spacing: -0.01em;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+  }
+
+  h2 {
+    font-size: 1.125rem;
+  }
+
+  h3 {
+    font-size: 1rem;
+  }
+
+  h4,
+  h5,
+  h6 {
+    font-size: 0.9375rem;
+  }
+
+  ul,
+  ol {
+    margin: 0.55rem 0;
+    padding-left: 1.35rem;
+  }
+
+  ul {
+    list-style: disc;
+  }
+
+  ol {
+    list-style: decimal;
+  }
+
+  li {
+    margin: 0.22rem 0;
+  }
+
+  li > ul,
+  li > ol {
+    margin: 0.2rem 0;
+  }
+
+  li::marker {
+    color: var(--cm-faint);
+  }
+
+  blockquote {
+    margin: 0.75rem 0;
+    border-left: 3px solid var(--cm-line-strong);
+    padding: 0.1rem 0 0.1rem 0.85rem;
+    color: var(--cm-muted);
+  }
+
+  a {
+    color: inherit;
+    text-decoration: underline;
+    text-decoration-color: var(--cm-line-strong);
+    text-underline-offset: 2px;
+    transition: text-decoration-color 0.15s ease;
+  }
+
+  a:hover {
+    text-decoration-color: currentColor;
+  }
+
+  strong {
+    font-weight: 600;
+  }
+
+  hr {
+    margin: 1.1rem 0;
+    border: 0;
+    border-top: 1px solid var(--cm-line);
+  }
+
+  // 行内代码；代码块由 CodeBlock 组件负责。
+  :not(pre) > code {
+    border: 1px solid var(--cm-line);
+    border-radius: 4px;
+    background: var(--cm-soft);
+    padding: 0.08rem 0.32rem;
+    font-family: var(--cm-font-mono);
+    font-size: 0.8125rem;
+  }
+
+  img {
+    max-width: 100%;
+    border-radius: 8px;
+  }
+
+  // 表格必须能横向滚动，不能把气泡撑破。
+  .cm-table-wrap {
+    margin: 0.75rem 0;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--cm-line);
+    border-radius: 8px;
+  }
+
+  table {
+    width: max-content;
+    min-width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8125rem;
+  }
+
+  th,
+  td {
+    border-bottom: 1px solid var(--cm-line);
+    padding: 0.45rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    background: var(--cm-soft);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  tr:last-child td {
+    border-bottom: 0;
+  }
+
+  input[type='checkbox'] {
+    margin-right: 0.35rem;
+    vertical-align: middle;
+  }
+
+  del {
+    color: var(--cm-muted);
+  }
+}
+
+// 代码块外壳与高亮配色。
+.cm-code {
+  border: 1px solid var(--cm-line);
+  border-radius: 10px;
+  background: var(--cm-code);
+  overflow: hidden;
+
+  pre {
+    margin: 0;
+    overflow-x: auto;
+    padding: 0.85rem 1rem;
+  }
+
+  code {
+    display: block;
+    font-family: var(--cm-font-mono);
+    font-size: 0.8125rem;
+    line-height: 1.65;
+    tab-size: 2;
+  }
+
+  .hljs-comment,
+  .hljs-quote {
+    color: var(--cm-syn-comment);
+    font-style: italic;
+  }
+
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-doctag,
+  .hljs-meta {
+    color: var(--cm-syn-keyword);
+  }
+
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-addition {
+    color: var(--cm-syn-string);
+  }
+
+  .hljs-number,
+  .hljs-symbol,
+  .hljs-bullet,
+  .hljs-link {
+    color: var(--cm-syn-number);
+  }
+
+  .hljs-title,
+  .hljs-title.function_,
+  .hljs-section,
+  .hljs-name {
+    color: var(--cm-syn-func);
+  }
+
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-variable,
+  .hljs-template-variable,
+  .hljs-type,
+  .hljs-built_in {
+    color: var(--cm-syn-attr);
+  }
+
+  .hljs-deletion {
+    color: var(--cm-danger);
+  }
+
+  .hljs-emphasis {
+    font-style: italic;
+  }
+
+  .hljs-strong {
+    font-weight: 600;
+  }
+}

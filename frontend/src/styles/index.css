@@ -4,6 +4,14 @@
 /* 用 class 控制暗色，便于后续做 light / dark / system 三态切换。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* 与验收档位对齐：420 / 760 / 1100 / 1400。 */
+@theme {
+  --breakpoint-xs: 26.25rem;
+  --breakpoint-md: 47.5rem;
+  --breakpoint-lg: 68.75rem;
+  --breakpoint-xl: 87.5rem;
+}
+
 @theme inline {
   --color-canvas: var(--cm-canvas);
   --color-sidebar: var(--cm-sidebar);
@@ -16,6 +24,7 @@
   --color-line: var(--cm-line);
   --color-line-strong: var(--cm-line-strong);
   --color-success: var(--cm-success);
+  --color-warning: var(--cm-warning);
   --color-danger: var(--cm-danger);
   --color-code: var(--cm-code);
 

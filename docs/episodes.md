@@ -38,7 +38,7 @@ hits = await longterm.search(user_id, session_id, "运动鞋怎么退货？")
 texts = [hit.text for hit in hits]
 ```
 
-不注入 longterm 时，压缩仍会保存待写记录，但不会即时写 ChromaDB。完整的自动重试调度和 `/chat` 多轮/长期记忆接入仍是后续步骤；仅完成这些代码，不代表运行中的旧版应用已经自动产生情景记忆。改代码后也需要更新运行实例。
+不注入 longterm 时，压缩仍会保存待写记录，但不会即时写 ChromaDB。完整的自动重试调度和 `/chat/stream` 多轮/长期记忆接入仍是后续步骤；仅完成这些代码，不代表运行中的旧版应用已经自动产生情景记忆。改代码后也需要更新运行实例。
 
 ## embedding 和检索规则
 

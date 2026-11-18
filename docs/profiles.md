@@ -1,6 +1,6 @@
 # 用户画像：episode 后提取、校验、合并
 
-画像是每个用户的一份结构化长期信息，跨 session 共用。它与“某次发生了什么”的 episode 分开保存；目前没有接入 `/chat`。
+画像是每个用户的一份结构化长期信息，跨 session 共用。它与“某次发生了什么”的 episode 分开保存；目前没有接入 `/chat/stream`。
 
 ## 使用方式
 
@@ -137,7 +137,7 @@ profile_texts = [hit.profile.model_dump() for hit in hits]
 peers = await profiles.find_similar_users(user_id, top_k=3)
 ```
 
-这些接口尚未接入 `ContextBuilder` / `/chat`。后续放进 context 的是经过校验的 profile 文字或 JSON，不是 embedding；相似用户的画像不能当成当前用户的个人记忆注入。
+这些接口尚未接入 `ContextBuilder` / `/chat/stream`。后续放进 context 的是经过校验的 profile 文字或 JSON，不是 embedding；相似用户的画像不能当成当前用户的个人记忆注入。
 
 ## 旧的一维记录和切换模型后怎么办
 

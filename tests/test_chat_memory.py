@@ -1,4 +1,4 @@
-"""多轮记忆接入 /chat 的接口测试：fakeredis + 替身 LLM，不访问网络。"""
+"""多轮记忆接入 /chat/stream 的接口测试：fakeredis + 替身 LLM，不访问网络。"""
 from __future__ import annotations
 
 import re
@@ -16,6 +16,7 @@ from core.llm import ChatResult, LLMError
 from memory.locks import LockBusyError
 from memory.service import ConversationMemory
 from memory.store import RedisMemoryStore
+from sse_helpers import chat_stream
 
 MODEL = "test-model"
 
@@ -105,17 +106,15 @@ async def test_second_turn_reads_first_turn(memory_env):
     llm = FakeLLM("您好，小李。")
     app.state.llm = llm
 
-    first = await send(
-        app, "POST", "/chat",
-        json=chat_body("我叫小李", request_id="r1"),
+    first = await chat_stream(
+        app, chat_body("我叫小李", request_id="r1"),
     )
-    second = await send(
-        app, "POST", "/chat",
-        json=chat_body("我叫什么？", request_id="r2"),
+    second = await chat_stream(
+        app, chat_body("我叫什么？", request_id="r2"),
     )
 
     assert first.status_code == 200
-    assert first.json()["session_id"] == "c1"
+    assert first.session_id == "c1"
     assert second.status_code == 200
     assert len(llm.calls) == 2
     assert llm.calls[1]["history"] == [
@@ -124,30 +123,7 @@ async def test_second_turn_reads_first_turn(memory_env):
     ]
     turns = await store.get_turns("u1", "c1")
     assert [turn.user_message for turn in turns] == ["我叫小李", "我叫什么？"]
-    assert second.json()["input_tokens"] == 10
-
-
-@pytest.mark.asyncio
-async def test_chat_persists_intent_atomically_with_successful_turn(memory_env, monkeypatch):
-    store, service = memory_env
-    settings = make_settings(intent=IntentSettings(enabled=True))
-    app = create_app(settings, memory=service)
-    fake_llm = FakeLLM("退款会在 3-5 个工作日到账。")
-    app.state.llm = fake_llm
-
-    async def recognize(message, llm, intent_settings, *, history=None):
-        assert message == "我的订单什么时候退款？"
-        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
-
-    monkeypatch.setattr("api.main._recognize_intent", recognize)
-    response = await send(app, "POST", "/chat", json=chat_body("我的订单什么时候退款？"))
-
-    assert response.status_code == 200
-    snapshot = await store.get_snapshot("u1", "c1")
-    assert len(snapshot.turns) == 1
-    assert snapshot.state["intent"]["intent"] == "refund"
-    assert snapshot.state["intent"]["confidence"] == 0.91
-    assert "intent" not in response.json()
+    assert second.text == "您好，小李。"
 
 
 @pytest.mark.asyncio
@@ -195,32 +171,11 @@ async def test_chat_stream_failed_generation_does_not_persist_intent(
         return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
 
     monkeypatch.setattr("api.main._recognize_intent", recognize)
-    response = await send(app, "POST", "/chat/stream", json=chat_body("我要退款"))
+    response = await chat_stream(app, chat_body("我要退款"))
 
     assert response.status_code == 200
-    assert "event: error" in response.text
-    assert len(calls) == 1
-    assert await store.get_state("u1", "c1") == {}
-    assert await store.get_turns("u1", "c1") == []
-
-
-@pytest.mark.asyncio
-async def test_failed_chat_may_recognize_but_does_not_persist_intent(memory_env, monkeypatch):
-    store, service = memory_env
-    settings = make_settings(intent=IntentSettings(enabled=True))
-    app = create_app(settings, memory=service)
-    app.state.llm = FakeLLM(error=LLMError("offline"))
-
-    calls = []
-
-    async def recognize(*args, **kwargs):
-        calls.append((args, kwargs))
-        return IntentResult(IntentCategory.REFUND, 0.91, IntentSource.LLM)
-
-    monkeypatch.setattr("api.main._recognize_intent", recognize)
-    response = await send(app, "POST", "/chat", json=chat_body("我要退款"))
-
-    assert response.status_code == 503
+    assert response.error is not None
+    assert response.error["error_code"] == "llm_unavailable"
     assert len(calls) == 1
     assert await store.get_state("u1", "c1") == {}
     assert await store.get_turns("u1", "c1") == []
@@ -233,11 +188,8 @@ async def test_different_conversations_do_not_share_history(memory_env):
     llm = FakeLLM()
     app.state.llm = llm
 
-    await send(app, "POST", "/chat", json=chat_body("第一段对话"))
-    await send(
-        app, "POST", "/chat",
-        json=chat_body("第二段对话", session_id="c2"),
-    )
+    await chat_stream(app, chat_body("第一段对话"))
+    await chat_stream(app, chat_body("第二段对话", session_id="c2"))
 
     assert llm.calls[1]["history"] == []
 
@@ -248,10 +200,10 @@ async def test_auto_generated_session_id_is_returned(memory_env):
     app = create_app(make_settings(), memory=service)
     app.state.llm = FakeLLM()
 
-    response = await send(app, "POST", "/chat", json=chat_body("你好", session_id=None))
+    response = await chat_stream(app, chat_body("你好", session_id=None))
 
     assert response.status_code == 200
-    assert re.fullmatch(r"[0-9a-f]{16}", response.json()["session_id"])
+    assert re.fullmatch(r"[0-9a-f]{16}", response.session_id)
 
 
 @pytest.mark.asyncio
@@ -262,13 +214,11 @@ async def test_failed_turn_is_not_persisted(memory_env):
         error=LLMError("模型响应超时", status_code=503, code="llm_timeout"),
     )
 
-    response = await send(
-        app, "POST", "/chat",
-        json=chat_body("查询订单", request_id="r1"),
-    )
+    response = await chat_stream(app, chat_body("查询订单", request_id="r1"))
 
-    assert response.status_code == 503
-    assert response.json()["error_code"] == "llm_timeout"
+    assert response.status_code == 200
+    assert response.error is not None
+    assert response.error["error_code"] == "llm_timeout"
     assert await store.get_turns("u1", "c1") == []
     assert await store.get_receipt("u1", "c1", "r1") is None
 
@@ -280,19 +230,13 @@ async def test_same_client_request_id_replays_without_calling_llm(memory_env):
     llm = FakeLLM("第一次回答")
     app.state.llm = llm
 
-    first = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", request_id="same"),
-    )
-    second = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", request_id="same"),
-    )
+    first = await chat_stream(app, chat_body("重复请求", request_id="same"))
+    second = await chat_stream(app, chat_body("重复请求", request_id="same"))
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["response"] == second.json()["response"]
-    assert first.json()["request_id"] == second.json()["request_id"]
+    assert first.text == second.text
+    assert first.request_id == second.request_id
     assert len(llm.calls) == 1
     assert len(await store.get_turns("u1", "c1")) == 1
 
@@ -304,10 +248,9 @@ async def test_same_client_request_id_with_different_message_conflicts(memory_en
     llm = FakeLLM()
     app.state.llm = llm
 
-    await send(app, "POST", "/chat", json=chat_body("第一句", request_id="same"))
-    response = await send(
-        app, "POST", "/chat",
-        json=chat_body("第二句", request_id="same"),
+    await chat_stream(app, chat_body("第一句", request_id="same"))
+    response = await chat_stream(
+        app, chat_body("第二句", request_id="same"),
     )
 
     assert response.status_code == 409
@@ -322,21 +265,19 @@ async def test_retry_without_session_id_uses_original_session(memory_env):
     llm = FakeLLM("原会话回答")
     app.state.llm = llm
 
-    first = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", session_id=None, request_id="same"),
+    first = await chat_stream(
+        app, chat_body("重复请求", session_id=None, request_id="same"),
     )
-    second = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", session_id=None, request_id="same"),
+    second = await chat_stream(
+        app, chat_body("重复请求", session_id=None, request_id="same"),
     )
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["session_id"] == second.json()["session_id"]
-    assert first.json()["request_id"] == second.json()["request_id"]
+    assert first.session_id == second.session_id
+    assert first.request_id == second.request_id
     assert len(llm.calls) == 1
-    assert len(await store.get_turns("u1", first.json()["session_id"])) == 1
+    assert len(await store.get_turns("u1", first.session_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -346,40 +287,16 @@ async def test_conflict_without_session_id_returns_409(memory_env):
     llm = FakeLLM()
     app.state.llm = llm
 
-    await send(
-        app, "POST", "/chat",
-        json=chat_body("第一句", session_id=None, request_id="same"),
+    await chat_stream(
+        app, chat_body("第一句", session_id=None, request_id="same"),
     )
-    response = await send(
-        app, "POST", "/chat",
-        json=chat_body("第二句", session_id=None, request_id="same"),
+    response = await chat_stream(
+        app, chat_body("第二句", session_id=None, request_id="same"),
     )
 
     assert response.status_code == 409
     assert response.json()["error_code"] == "client_request_id_conflict"
     assert len(llm.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_replay_works_even_when_model_is_not_configured(memory_env):
-    _, service = memory_env
-    app = create_app(make_settings(), memory=service)
-    app.state.llm = FakeLLM("缓存回答")
-
-    first = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", request_id="same"),
-    )
-    assert first.status_code == 200
-
-    app.state.llm = None
-    second = await send(
-        app, "POST", "/chat",
-        json=chat_body("重复请求", request_id="same"),
-    )
-
-    assert second.status_code == 200
-    assert second.json()["response"] == "缓存回答"
 
 
 @pytest.mark.asyncio
@@ -390,7 +307,7 @@ async def test_summary_is_injected_into_system_not_messages(memory_env):
     llm = FakeLLM()
     app.state.llm = llm
 
-    response = await send(app, "POST", "/chat", json=chat_body("退款到哪了？"))
+    response = await chat_stream(app, chat_body("退款到哪了？"))
 
     assert response.status_code == 200
     assert "用户叫小李，正在咨询退款。" in llm.calls[0]["system"]
@@ -409,7 +326,7 @@ async def test_read_failure_degrades_to_no_history(memory_env):
 
     service.read_context = broken
 
-    response = await send(app, "POST", "/chat", json=chat_body("你好"))
+    response = await chat_stream(app, chat_body("你好"))
 
     assert response.status_code == 200
     assert len(llm.calls) == 1
@@ -427,14 +344,15 @@ async def test_commit_failure_still_returns_answer(memory_env):
 
     service.commit = broken
 
-    response = await send(app, "POST", "/chat", json=chat_body("你好"))
+    response = await chat_stream(app, chat_body("你好"))
 
     assert response.status_code == 200
-    assert response.json()["response"] == "答案仍然返回"
+    assert response.text == "答案仍然返回"
+    assert response.done["response"] == "答案仍然返回"
 
 
 @pytest.mark.asyncio
-async def test_conversation_busy_returns_409(memory_env):
+async def test_conversation_busy_is_streamed_as_error_event(memory_env):
     _, service = memory_env
     app = create_app(make_settings(), memory=service)
     app.state.llm = FakeLLM()
@@ -446,11 +364,12 @@ async def test_conversation_busy_returns_409(memory_env):
 
     service.conversation = busy
 
-    response = await send(app, "POST", "/chat", json=chat_body("你好"))
+    response = await chat_stream(app, chat_body("你好"))
 
-    assert response.status_code == 409
-    assert response.json()["error_code"] == "conversation_busy"
-    assert response.headers["retry-after"] == "1"
+    assert response.status_code == 200
+    assert response.error is not None
+    assert response.error["error_code"] == "conversation_busy"
+    assert "正在处理" in response.error["detail"]
 
 
 @pytest.mark.asyncio
@@ -610,7 +529,7 @@ async def test_memory_disabled_keeps_single_turn_behavior():
     llm = FakeLLM()
     app.state.llm = llm
 
-    response = await send(app, "POST", "/chat", json=chat_body("你好"))
+    response = await chat_stream(app, chat_body("你好"))
 
     assert response.status_code == 200
     assert llm.calls[0]["history"] == []

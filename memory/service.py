@@ -1,6 +1,6 @@
 """应用层记忆门面：组合 Redis store、上下文、压缩和后台维护。
 
-`/chat` 只依赖本模块，不直接拼装 store/compactor/maintainer；
+`/chat/stream` 只依赖本模块，不直接拼装 store/compactor/maintainer；
 测试可绕过 `start()` 直接注入 fake store。
 """
 from __future__ import annotations

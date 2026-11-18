@@ -23,6 +23,16 @@ class FakeLLM:
         self.calls.append((message, kwargs))
         return ChatResult("收到")
 
+    async def stream_chat(self, message, *, history=None, system=None):
+        kwargs = {}
+        if history is not None:
+            kwargs["history"] = history
+        if system is not None:
+            kwargs["system"] = system
+        self.calls.append((message, kwargs))
+        for chunk in ("收", "到"):
+            yield chunk
+
 
 def write_skill(root, skill_id="billing", body=BODY):
     directory = root / skill_id
@@ -44,7 +54,7 @@ def make_app(root, **kwargs):
     return app
 
 
-async def send(app, method="POST", url="/chat", **kwargs):
+async def send(app, method="POST", url="/chat/stream", **kwargs):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
         return await client.request(method, url, **kwargs)
 
