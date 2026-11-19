@@ -49,6 +49,36 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in _TRUE_VALUES
 
 
+def _env_non_negative_int(name: str, default: int) -> int:
+    """读取非负整数配置；工具重试次数、缓存时间等允许 0。"""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _env_non_negative_float(name: str, default: float) -> float:
+    """读取非负浮点配置；退避基数等允许 0。"""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _env_choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    """读取枚举配置；非法值回退默认值，避免错误配置阻塞启动。"""
+    raw = os.getenv(name, "").strip().lower()
+    return raw if raw in allowed else default
+
+
 @dataclass(frozen=True, slots=True)
 class MemorySettings:
     """短期记忆（Redis）配置。
@@ -143,6 +173,110 @@ class SkillSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolSettings:
+    """进程内 function calling 与工具管理器配置。
+
+    默认关闭；所有执行预算都在这里集中管理，避免散落在 tool_manager 或 API 层。
+    `ToolSettings()` 的默认值只用于库调用和测试，应用进程通过 `Settings.from_env()` 读取环境变量。
+    """
+
+    enabled: bool = False
+    trigger: str = "auto"  # auto / always / off
+    max_rounds: int = 2
+    max_calls_per_round: int = 4
+    max_calls_total: int = 6
+    phase_timeout_s: float = 15.0
+    timeout_s: float = 3.0
+    max_retries: int = 1
+    retry_backoff_s: float = 0.1
+    circuit_failure_threshold: int = 5
+    circuit_recovery_s: float = 60.0
+    cache_ttl_s: float = 30.0
+    cache_max_entries: int = 1024
+    max_result_chars: int = 4000
+    max_schema_hint_chars: int = 800
+    rerank_enabled: bool = False
+    rerank_top_k: int = 5
+    stream_events: bool = False
+    debug: bool = False
+    protocol_fallback: bool = True
+    demo_orders_path: str = "data/demo_orders.json"
+
+    def __post_init__(self) -> None:
+        trigger = str(self.trigger).strip().lower()
+        object.__setattr__(self, "trigger", trigger)
+        object.__setattr__(self, "demo_orders_path", str(self.demo_orders_path or "").strip())
+        if trigger not in {"auto", "always", "off"}:
+            raise ValueError("COMMERCEMIND_TOOLS_TRIGGER 仅支持 auto、always、off")
+
+        positive_ints = (
+            "max_rounds",
+            "max_calls_per_round",
+            "max_calls_total",
+            "circuit_failure_threshold",
+            "cache_max_entries",
+            "rerank_top_k",
+        )
+        for name in positive_ints:
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} 必须是正整数")
+
+        for name in ("max_retries",):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} 必须是非负整数")
+
+        for name in ("phase_timeout_s", "timeout_s", "retry_backoff_s", "circuit_recovery_s", "cache_ttl_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{name} 必须是非负数")
+        for name in ("phase_timeout_s", "timeout_s", "circuit_recovery_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} 必须大于 0")
+
+        if self.timeout_s > self.phase_timeout_s:
+            raise ValueError("单个工具超时不能大于工具阶段总预算")
+        if self.max_calls_per_round > self.max_calls_total:
+            raise ValueError("max_calls_per_round 不能大于 max_calls_total")
+        if not 256 <= self.max_result_chars <= 20000:
+            raise ValueError("max_result_chars 必须在 256 到 20000 之间")
+        if not 128 <= self.max_schema_hint_chars <= 4000:
+            raise ValueError("max_schema_hint_chars 必须在 128 到 4000 之间")
+        if not self.demo_orders_path:
+            raise ValueError("demo_orders_path 不能为空")
+
+    @classmethod
+    def from_env(cls) -> "ToolSettings":
+        """从 `COMMERCEMIND_TOOLS_*` 构建配置；非法数值回退默认值。"""
+        return cls(
+            enabled=_env_bool("COMMERCEMIND_TOOLS_ENABLED", False),
+            trigger=_env_choice(
+                "COMMERCEMIND_TOOLS_TRIGGER", "auto", frozenset({"auto", "always", "off"}),
+            ),
+            max_rounds=_env_int("COMMERCEMIND_TOOLS_MAX_ROUNDS", 2),
+            max_calls_per_round=_env_int("COMMERCEMIND_TOOLS_MAX_CALLS_PER_ROUND", 4),
+            max_calls_total=_env_int("COMMERCEMIND_TOOLS_MAX_CALLS_TOTAL", 6),
+            phase_timeout_s=_env_float("COMMERCEMIND_TOOLS_PHASE_TIMEOUT_S", 15.0),
+            timeout_s=_env_float("COMMERCEMIND_TOOLS_TIMEOUT_S", 3.0),
+            max_retries=_env_non_negative_int("COMMERCEMIND_TOOLS_MAX_RETRIES", 1),
+            retry_backoff_s=_env_non_negative_float("COMMERCEMIND_TOOLS_RETRY_BACKOFF_S", 0.1),
+            circuit_failure_threshold=_env_int("COMMERCEMIND_TOOLS_CIRCUIT_FAILURE_THRESHOLD", 5),
+            circuit_recovery_s=_env_float("COMMERCEMIND_TOOLS_CIRCUIT_RECOVERY_S", 60.0),
+            cache_ttl_s=_env_non_negative_float("COMMERCEMIND_TOOLS_CACHE_TTL_S", 30.0),
+            cache_max_entries=_env_int("COMMERCEMIND_TOOLS_CACHE_MAX_ENTRIES", 1024),
+            max_result_chars=_env_int("COMMERCEMIND_TOOLS_MAX_RESULT_CHARS", 4000),
+            max_schema_hint_chars=_env_int("COMMERCEMIND_TOOLS_MAX_SCHEMA_HINT_CHARS", 800),
+            rerank_enabled=_env_bool("COMMERCEMIND_TOOLS_RERANK_ENABLED", False),
+            rerank_top_k=_env_int("COMMERCEMIND_TOOLS_RERANK_TOP_K", 5),
+            stream_events=_env_bool("COMMERCEMIND_TOOLS_STREAM_EVENTS", False),
+            debug=_env_bool("COMMERCEMIND_TOOLS_DEBUG", False),
+            protocol_fallback=_env_bool("COMMERCEMIND_TOOLS_PROTOCOL_FALLBACK", True),
+            demo_orders_path=os.getenv("COMMERCEMIND_TOOLS_DEMO_ORDERS", "").strip() or "data/demo_orders.json",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """运行期配置。
 
@@ -162,6 +296,7 @@ class Settings:
     memory: MemorySettings = field(default_factory=MemorySettings)
     intent: IntentSettings = field(default_factory=IntentSettings)
     skills: SkillSettings = field(default_factory=SkillSettings)
+    tools: ToolSettings = field(default_factory=ToolSettings)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "api_key", self.api_key.strip())
@@ -221,4 +356,5 @@ class Settings:
                 embedding_threshold=_env_float("COMMERCEMIND_INTENT_EMBEDDING_THRESHOLD", 0.72),
                 failure_policy=os.getenv("COMMERCEMIND_INTENT_FAILURE_POLICY", "available_sources").strip(),
             ),
+            tools=ToolSettings.from_env(),
         )

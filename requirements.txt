@@ -5,6 +5,8 @@
 anthropic==0.40.0
 # embedding HTTP 客户端（原为 SDK 的间接依赖）。
 httpx>=0.27,<1
+# Function Calling 工具参数 JSON Schema 校验。
+jsonschema>=4.22,<5
 
 # ── Web 框架 ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5
