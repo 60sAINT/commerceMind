@@ -10,6 +10,7 @@ from tooling.tool_manager import (
     ToolResult,
     ToolSpec,
     ToolStats,
+    validate_params,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "ToolSpec",
     "ToolStats",
     "ToolValidationError",
+    "validate_params",
 ]

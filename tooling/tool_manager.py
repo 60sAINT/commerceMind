@@ -1,12 +1,13 @@
 """进程内工具管理器：工具契约、注册表与统一执行入口。
 
-T1 只落地“契约 + 注册表”：
+T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验：
 
 - `ToolContext` / `ToolSpec` / `ToolResult` / `ToolStats` / `CircuitState`；
 - `ToolManager.register()` / `unregister()` / `definitions()` / `get_stats()` / `fork()`；
-- `execute()` 目前只做注册表查找、handler 分发和基础统计。
+- `validate_params()` 在 handler 之前校验模型参数，`schema_hint()` 给模型精简 schema；
+- `execute()` 目前只做注册表查找、参数校验、handler 分发和基础统计。
 
-参数校验、超时重试、TTL 缓存、熔断执行、降级与重排分别在 T2–T6 接入；
+超时重试、TTL 缓存、熔断执行、降级与重排分别在 T3–T6 接入；
 本模块不依赖 FastAPI，也不依赖具体 LLM 或业务工具，可被脚本、测试、评测直接复用。
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import re
 import time
@@ -22,7 +24,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from tooling.errors import ToolErrorCode
+from jsonschema import ValidationError, validators
+from jsonschema.exceptions import SchemaError
+
+from tooling.errors import ToolErrorCode, ToolValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +164,109 @@ class ToolSpec:
 
         if normalized.setdefault("additionalProperties", False) is not False:
             raise ValueError("工具 schema 必须禁止额外字段（additionalProperties=false）")
+
+        try:
+            validators.validator_for(normalized).check_schema(normalized)
+        except SchemaError as exc:
+            raise ValueError(f"input_schema 不是合法的 JSON Schema: {exc.message}") from None
         return normalized
+
+
+_HINT_FIELD_KEYS = (
+    "type",
+    "enum",
+    "const",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+)
+
+
+def validate_params(spec: ToolSpec, params: Any) -> dict[str, Any]:
+    """在进入 handler 前校验并规范化工具参数。
+
+    只接受 JSON 对象；字符串值去掉首尾空白，不做隐式类型强转。
+    校验失败统一抛 `ToolValidationError`，错误信息面向模型，可据此自我修复。
+    """
+    if not isinstance(params, Mapping):
+        raise ToolValidationError(
+            "工具参数必须是 JSON 对象",
+            path="参数",
+            validator="type",
+        )
+
+    arguments = _normalize_arguments(dict(params))
+    validator = validators.validator_for(spec.input_schema)(spec.input_schema)
+    try:
+        validator.validate(arguments)
+    except ValidationError as exc:
+        raise _to_validation_error(exc) from None
+    return arguments
+
+
+def _normalize_arguments(value: Any) -> Any:
+    """递归去空白：字典/列表保持结构，字符串只 strip，不转换类型。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        return {key: _normalize_arguments(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_arguments(item) for item in value]
+    return value
+
+
+def _to_validation_error(exc: ValidationError) -> ToolValidationError:
+    path = ".".join(str(part) for part in exc.absolute_path) or "参数"
+    validator = exc.validator or "unknown"
+
+    if validator == "required":
+        required = exc.validator_value if isinstance(exc.validator_value, list) else []
+        instance = exc.instance if isinstance(exc.instance, Mapping) else {}
+        missing = [name for name in required if name not in instance]
+        target = missing[0] if missing else None
+        message = f"缺少必填字段: {', '.join(missing) or '未知'}"
+        if target:
+            path = f"{path}.{target}" if path != "参数" else target
+    elif validator == "additionalProperties":
+        properties = exc.schema.get("properties", {}) if isinstance(exc.schema, Mapping) else {}
+        instance = exc.instance if isinstance(exc.instance, Mapping) else {}
+        extra = [name for name in instance if name not in properties]
+        target = extra[0] if extra else None
+        message = f"不支持字段: {', '.join(extra) or '未知'}"
+        if target:
+            path = f"{path}.{target}" if path != "参数" else target
+    elif validator == "type":
+        expected = exc.validator_value
+        if isinstance(expected, list):
+            expected = "/".join(str(item) for item in expected)
+        message = f"字段 {path} 类型应为 {expected}"
+    elif validator == "enum":
+        values = ", ".join(json.dumps(item, ensure_ascii=False) for item in exc.validator_value)
+        message = f"字段 {path} 必须是以下之一: {values}"
+    elif validator in {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}:
+        operator = {
+            "minimum": ">=",
+            "maximum": "<=",
+            "exclusiveMinimum": ">",
+            "exclusiveMaximum": "<",
+        }[validator]
+        message = f"字段 {path} 必须 {operator} {exc.validator_value}"
+    elif validator in {"minLength", "maxLength"}:
+        relation = "至少" if validator == "minLength" else "最多"
+        message = f"字段 {path} 长度{relation} {exc.validator_value} 个字符"
+    elif validator in {"minItems", "maxItems"}:
+        relation = "至少" if validator == "minItems" else "最多"
+        message = f"字段 {path} 数量{relation} {exc.validator_value} 个"
+    elif validator == "pattern":
+        message = f"字段 {path} 格式不匹配"
+    else:
+        message = f"字段 {path} 未通过校验（{validator}）"
+
+    return ToolValidationError(message, path=path, validator=validator)
 
 
 @dataclass(slots=True)
@@ -294,15 +401,19 @@ class ToolManager:
         reranker: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        max_schema_hint_chars: int = 800,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock 必须可调用")
         if not callable(sleep):
             raise TypeError("sleep 必须可调用")
+        if type(max_schema_hint_chars) is not int or not 128 <= max_schema_hint_chars <= 4000:
+            raise ValueError("max_schema_hint_chars 必须在 128 到 4000 之间")
         self._tools: dict[str, RegisteredTool] = {}
         self._reranker = reranker
         self._clock = clock
         self._sleep = sleep
+        self._max_schema_hint_chars = max_schema_hint_chars
 
     # ── 注册 / 注销 ──────────────────────────────────────────────────────────
 
@@ -349,12 +460,53 @@ class ToolManager:
             for _, registered in sorted(self._tools.items())
         ]
 
+    def schema_hint(self, tool: ToolSpec | str) -> dict[str, Any] | None:
+        """给模型看的精简 schema：required、字段类型/枚举/范围/pattern。
+
+        预算按紧凑 JSON 字符串计；超出 `max_schema_hint_chars` 时逐步去掉
+        约束细节，最后保证字段名和必填列表仍然可读。未知工具返回 None。
+        """
+        if isinstance(tool, str):
+            spec = self.get_spec(tool)
+        else:
+            spec = tool
+        if spec is None:
+            return None
+
+        full = _build_schema_hint(spec.input_schema, detail="full")
+        if _hint_size(full) <= self._max_schema_hint_chars:
+            return full
+
+        compact = _build_schema_hint(spec.input_schema, detail="compact")
+        if _hint_size(compact) <= self._max_schema_hint_chars:
+            return compact
+
+        minimal = _build_schema_hint(spec.input_schema, detail="minimal")
+        if _hint_size(minimal) <= self._max_schema_hint_chars:
+            return minimal
+
+        # 极端情况：字段太多，逐个保留字段名直到预算用尽；被截断时显式标记。
+        limited: dict[str, Any] = {
+            "type": "object",
+            "required": list(minimal["required"]),
+            "additionalProperties": False,
+            "properties": {},
+            "truncated": True,
+        }
+        for name in minimal["properties"]:
+            limited["properties"][name] = {}
+            if _hint_size(limited) > self._max_schema_hint_chars:
+                limited["properties"].pop(name)
+                break
+        limited["required"] = [name for name in limited["required"] if name in limited["properties"]]
+        return limited
+
     # ── 执行 ─────────────────────────────────────────────────────────────────
 
     async def execute(
         self,
         name: str,
-        params: dict[str, Any],
+        params: Any,
         context: ToolContext,
         *,
         deadline: float | None = None,
@@ -363,7 +515,7 @@ class ToolManager:
     ) -> ToolResult:
         """执行一次工具调用。
 
-        T1 只做注册表查找、handler 分发和基础统计；`deadline`、`use_cache`、
+        T2 在 handler 之前完成 JSON Schema 校验；`deadline`、`use_cache`、
         `rerank_top_k` 先保留在签名里，由 T3/T4/T6 接入。
         """
         if not isinstance(context, ToolContext):
@@ -379,11 +531,27 @@ class ToolManager:
                 error=f"工具未注册: {name}",
             )
 
+        try:
+            arguments = validate_params(registered.spec, params)
+        except ToolValidationError as exc:
+            # 参数错误是调用方/模型错误：不重试、不执行、不计熔断。
+            registered.stats.invalid += 1
+            logger.warning("工具参数校验失败: %s (%s)", name, exc.validator or "unknown")
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                usable=False,
+                attempts=0,
+                error_code=ToolErrorCode.INVALID_ARGUMENTS.value,
+                error=exc.message,
+                retryable=False,
+            )
+
         started = self._clock()
         registered.stats.total += 1
         registered.stats.attempts += 1
         try:
-            data = await self._invoke(registered.spec.handler, params, context)
+            data = await self._invoke(registered.spec.handler, arguments, context)
         except asyncio.CancelledError:
             # 取消必须原样传播：不写缓存、不当作工具失败计入熔断。
             raise
@@ -455,7 +623,12 @@ class ToolManager:
 
     def fork(self) -> "ToolManager":
         """复制注册表，隔离统计和熔断状态；供评测/测试使用。"""
-        other = type(self)(self._reranker, clock=self._clock, sleep=self._sleep)
+        other = type(self)(
+            self._reranker,
+            clock=self._clock,
+            sleep=self._sleep,
+            max_schema_hint_chars=self._max_schema_hint_chars,
+        )
         for name, registered in self._tools.items():
             other._tools[name] = RegisteredTool(
                 spec=registered.spec,
@@ -466,6 +639,43 @@ class ToolManager:
                 ),
             )
         return other
+
+
+def _build_schema_hint(
+    schema: Mapping[str, Any],
+    *,
+    detail: str,
+) -> dict[str, Any]:
+    """构造精简 schema；detail=full/compact/minimal 控制字段细节层级。"""
+    properties = schema.get("properties", {})
+    hint_properties: dict[str, Any] = {}
+    for name, field_schema in properties.items():
+        if detail == "minimal":
+            hint_properties[name] = {}
+            continue
+        if not isinstance(field_schema, Mapping):
+            hint_properties[name] = {}
+            continue
+
+        item: dict[str, Any] = {}
+        for key in _HINT_FIELD_KEYS:
+            if key not in field_schema:
+                continue
+            if detail == "compact" and key in {"pattern", "minimum", "maximum", "minLength", "maxLength"}:
+                continue
+            item[key] = copy.deepcopy(field_schema[key])
+        hint_properties[name] = item
+
+    return {
+        "type": "object",
+        "required": list(schema.get("required", [])),
+        "additionalProperties": False,
+        "properties": hint_properties,
+    }
+
+
+def _hint_size(hint: Mapping[str, Any]) -> int:
+    return len(json.dumps(hint, ensure_ascii=False, separators=(",", ":")))
 
 
 def _require_positive_number(name: str, value: Any) -> None:

@@ -349,7 +349,10 @@ async def test_execute_failure_then_success_resets_consecutive_fails():
         return {"ok": True}
 
     manager = ToolManager()
-    manager.register(make_spec(handler=handler))
+    manager.register(make_spec(
+        input_schema=make_schema(order_id={"type": "string"}, ok={"type": "boolean"}),
+        handler=handler,
+    ))
 
     await manager.execute("lookup_order", {"ok": False}, make_context())
     result = await manager.execute("lookup_order", {"ok": True}, make_context())
