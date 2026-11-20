@@ -1,13 +1,13 @@
 """进程内工具管理器：工具契约、注册表与统一执行入口。
 
-T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验：
+T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验，T3 接入超时与重试：
 
 - `ToolContext` / `ToolSpec` / `ToolResult` / `ToolStats` / `CircuitState`；
 - `ToolManager.register()` / `unregister()` / `definitions()` / `get_stats()` / `fork()`；
 - `validate_params()` 在 handler 之前校验模型参数，`schema_hint()` 给模型精简 schema；
-- `execute()` 目前只做注册表查找、参数校验、handler 分发和基础统计。
+- `execute()` 完成注册表查找、参数校验、单次超时、read-only 重试与统计。
 
-超时重试、TTL 缓存、熔断执行、降级与重排分别在 T3–T6 接入；
+TTL 缓存、熔断执行、降级与重排分别在 T4–T6 接入；
 本模块不依赖 FastAPI，也不依赖具体 LLM 或业务工具，可被脚本、测试、评测直接复用。
 """
 from __future__ import annotations
@@ -17,6 +17,8 @@ import copy
 import inspect
 import json
 import logging
+import math
+import random
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -27,7 +29,7 @@ from typing import Any
 from jsonschema import ValidationError, validators
 from jsonschema.exceptions import SchemaError
 
-from tooling.errors import ToolErrorCode, ToolValidationError
+from tooling.errors import ToolError, ToolErrorCode, ToolValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -515,8 +517,9 @@ class ToolManager:
     ) -> ToolResult:
         """执行一次工具调用。
 
-        T2 在 handler 之前完成 JSON Schema 校验；`deadline`、`use_cache`、
-        `rerank_top_k` 先保留在签名里，由 T3/T4/T6 接入。
+        `deadline` 是 `time.monotonic()` 绝对时间，由 FunctionCallingLoop 传入。
+        每次尝试取 `min(tool.timeout_s, deadline - now)`；只有 `retry_safe=True`
+        的工具会按指数退避重试。`use_cache`、`rerank_top_k` 由 T4/T6 接入。
         """
         if not isinstance(context, ToolContext):
             raise TypeError("context 必须是 ToolContext")
@@ -547,43 +550,126 @@ class ToolManager:
                 retryable=False,
             )
 
+        spec = registered.spec
+        stats = registered.stats
         started = self._clock()
-        registered.stats.total += 1
-        registered.stats.attempts += 1
-        try:
-            data = await self._invoke(registered.spec.handler, arguments, context)
-        except asyncio.CancelledError:
-            # 取消必须原样传播：不写缓存、不当作工具失败计入熔断。
-            raise
-        except Exception as exc:
-            latency_ms = (self._clock() - started) * 1000
-            registered.stats.failed += 1
-            registered.stats.consecutive_fails += 1
-            registered.stats.total_latency_ms += latency_ms
-            logger.error("工具执行失败: %s (%s)", name, type(exc).__name__)
-            return ToolResult(
-                tool_name=name,
-                success=False,
-                usable=False,
-                attempts=1,
-                latency_ms=latency_ms,
-                error_code=ToolErrorCode.TOOL_HANDLER_ERROR.value,
-                error=str(exc) or type(exc).__name__,
-                retryable=bool(registered.spec.retry_safe),
-            )
+        stats.total += 1
+
+        attempts = 0
+        max_attempts = 1 + (spec.max_retries if spec.retry_safe else 0)
+        last_error_code: str | None = None
+        last_error: str | None = None
+        last_retryable = False
+
+        while attempts < max_attempts:
+            attempt_timeout = self._attempt_timeout(spec, deadline)
+            if attempt_timeout <= 0:
+                if attempts == 0:
+                    last_error_code = ToolErrorCode.TOOL_DEADLINE_EXCEEDED.value
+                    last_error = "工具阶段预算已耗尽"
+                break
+
+            if attempts > 0:
+                stats.retries += 1
+            attempts += 1
+            stats.attempts += 1
+            try:
+                async with asyncio.timeout(attempt_timeout):
+                    data = await self._invoke(spec.handler, copy.deepcopy(arguments), context)
+            except asyncio.CancelledError:
+                # 取消必须原样传播：不写缓存、不当作工具失败计入熔断。
+                raise
+            except TimeoutError:
+                stats.timeout += 1
+                last_error_code = ToolErrorCode.TOOL_TIMEOUT.value
+                last_error = f"工具执行超时（{attempt_timeout:.3g}s）"
+                last_retryable = True
+                logger.warning(
+                    "工具超时: %s (attempt %s/%s)", name, attempts, max_attempts,
+                )
+            except ToolError as exc:
+                last_error_code = exc.code.value
+                last_error = exc.message
+                last_retryable = exc.retryable and exc.code in {
+                    ToolErrorCode.TOOL_TIMEOUT, ToolErrorCode.TOOL_HANDLER_ERROR,
+                }
+            except Exception as exc:
+                last_error_code = ToolErrorCode.TOOL_HANDLER_ERROR.value
+                last_error = str(exc) or type(exc).__name__
+                last_retryable = True
+                logger.error("工具执行失败: %s (%s)", name, type(exc).__name__)
+            else:
+                latency_ms = (self._clock() - started) * 1000
+                stats.success += 1
+                stats.consecutive_fails = 0
+                stats.total_latency_ms += latency_ms
+                return ToolResult(
+                    tool_name=name,
+                    success=True,
+                    usable=True,
+                    data=data,
+                    attempts=attempts,
+                    latency_ms=latency_ms,
+                )
+
+            if not last_retryable or not spec.retry_safe or attempts >= max_attempts:
+                break
+
+            delay = self._retry_delay(spec, attempts, deadline)
+            if delay is None:
+                break
+            if delay > 0:
+                if deadline is None:
+                    await self._sleep(delay)
+                else:
+                    remaining = deadline - self._clock()
+                    if remaining <= 0:
+                        break
+                    try:
+                        async with asyncio.timeout(remaining):
+                            await self._sleep(delay)
+                    except TimeoutError:
+                        break
 
         latency_ms = (self._clock() - started) * 1000
-        registered.stats.success += 1
-        registered.stats.consecutive_fails = 0
-        registered.stats.total_latency_ms += latency_ms
+        stats.failed += 1
+        stats.consecutive_fails += 1
+        stats.total_latency_ms += latency_ms
+        if last_error_code is None:
+            last_error_code = ToolErrorCode.TOOL_DEADLINE_EXCEEDED.value
+            last_error = "工具阶段预算已耗尽"
         return ToolResult(
             tool_name=name,
-            success=True,
-            usable=True,
-            data=data,
-            attempts=1,
+            success=False,
+            usable=False,
+            attempts=attempts,
             latency_ms=latency_ms,
+            error_code=last_error_code,
+            error=last_error,
+            retryable=last_retryable and spec.retry_safe,
         )
+
+    def _attempt_timeout(self, spec: ToolSpec, deadline: float | None) -> float:
+        """单次尝试的超时：不超过工具自身超时，也不超过剩余阶段预算。"""
+        if deadline is None:
+            return spec.timeout_s
+        return min(spec.timeout_s, deadline - self._clock())
+
+    def _retry_delay(self, spec: ToolSpec, attempts: int, deadline: float | None) -> float | None:
+        """指数退避 + 抖动；预算不足时返回 None，表示不再重试。"""
+        remaining: float | None = None
+        if deadline is not None:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return None
+
+        base = spec.retry_backoff_s * (2 ** (attempts - 1))
+        if base <= 0:
+            return 0.0
+        delay = base + random.uniform(0, base * 0.1)
+        if remaining is not None:
+            delay = min(delay, remaining)
+        return max(delay, 0.0)
 
     async def _invoke(
         self,
@@ -591,7 +677,7 @@ class ToolManager:
         params: dict[str, Any],
         context: ToolContext,
     ) -> Any:
-        """同步 handler 放进线程池，异步 handler 直接 await，避免阻塞事件循环。"""
+        """同步 handler 在线程池执行；超时/取消只停止等待，不能终止线程。"""
         if inspect.iscoroutinefunction(handler):
             return await handler(params, context)
         result = await asyncio.to_thread(handler, params, context)
@@ -679,10 +765,10 @@ def _hint_size(hint: Mapping[str, Any]) -> int:
 
 
 def _require_positive_number(name: str, value: Any) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} 必须是大于 0 的数字")
 
 
 def _require_non_negative_number(name: str, value: Any) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} 必须是非负数字")

@@ -323,7 +323,8 @@ async def test_execute_handler_error_is_returned_not_raised():
         raise RuntimeError("demo gateway down")
 
     manager = ToolManager()
-    manager.register(make_spec(handler=handler))
+    # T3 起默认 retry_safe=True 会自动重试；这里固定单次尝试，只验证错误不被抛出。
+    manager.register(make_spec(handler=handler, max_retries=0))
 
     result = await manager.execute("lookup_order", {}, make_context())
 
