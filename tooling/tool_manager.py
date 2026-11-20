@@ -1,19 +1,23 @@
 """进程内工具管理器：工具契约、注册表与统一执行入口。
 
-T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验，T3 接入超时与重试：
+T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验，T3 接入超时与重试，
+T4 接入 TTL 缓存：
 
 - `ToolContext` / `ToolSpec` / `ToolResult` / `ToolStats` / `CircuitState`；
 - `ToolManager.register()` / `unregister()` / `definitions()` / `get_stats()` / `fork()`；
 - `validate_params()` 在 handler 之前校验模型参数，`schema_hint()` 给模型精简 schema；
-- `execute()` 完成注册表查找、参数校验、单次超时、read-only 重试与统计。
+- `execute()` 完成注册表查找、参数校验、TTL 缓存、单次超时、read-only 重试与统计；
+- `invalidate_cache()` 通过版本号同时实现主动失效与在途结果不回填。
 
-TTL 缓存、熔断执行、降级与重排分别在 T4–T6 接入；
+缓存结构与 EchoMind 保持一致：进程内字典、`工具名 + MD5` 键、`(数据, 过期时间, 是否重排)` 值。
+熔断执行、降级与重排分别在 T5–T6 接入；
 本模块不依赖 FastAPI，也不依赖具体 LLM 或业务工具，可被脚本、测试、评测直接复用。
 """
 from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -100,7 +104,7 @@ class ToolSpec:
     timeout_s: float = 3.0
     max_retries: int = 1
     retry_backoff_s: float = 0.1
-    cache_ttl_s: float = 30.0  # 0 = 不缓存
+    cache_ttl_s: float = 0.0  # 0 = 不缓存（与 EchoMind 一致，工具显式开启）
     cache_scope: tuple[str, ...] = ("user_id",)
     retry_safe: bool = True  # 只读工具 True；副作用工具 False
     supports_rerank: bool = False
@@ -404,6 +408,7 @@ class ToolManager:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_schema_hint_chars: int = 800,
+        cache_max_entries: int = 5000,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock 必须可调用")
@@ -411,28 +416,35 @@ class ToolManager:
             raise TypeError("sleep 必须可调用")
         if type(max_schema_hint_chars) is not int or not 128 <= max_schema_hint_chars <= 4000:
             raise ValueError("max_schema_hint_chars 必须在 128 到 4000 之间")
+        if type(cache_max_entries) is not int or not 1 <= cache_max_entries <= 1_000_000:
+            raise ValueError("cache_max_entries 必须在 1 到 1000000 之间")
         self._tools: dict[str, RegisteredTool] = {}
         self._reranker = reranker
         self._clock = clock
         self._sleep = sleep
         self._max_schema_hint_chars = max_schema_hint_chars
+        self._cache_max_entries = cache_max_entries
+        self._cache: dict[str, tuple[Any, float, bool]] = {}
+        self._cache_versions: dict[str, int] = {}
 
     # ── 注册 / 注销 ──────────────────────────────────────────────────────────
 
     def register(self, tool: ToolSpec) -> None:
-        """注册工具；重名直接报错，避免启动时静默覆盖。"""
+        """注册工具；重名直接报错，注册前先失效同名缓存。"""
         if not isinstance(tool, ToolSpec):
             raise TypeError("只能注册 ToolSpec")
         if tool.name in self._tools:
             raise ValueError(f"工具已注册: {tool.name}")
+        self.invalidate_cache(tool.name)
         self._tools[tool.name] = RegisteredTool(spec=tool)
         logger.info("注册工具: %s", tool.name)
 
     def unregister(self, name: str) -> bool:
-        """注销工具并丢弃其统计与熔断状态；返回是否真的删除了。"""
+        """注销工具并丢弃其统计、熔断状态与缓存；返回是否真的删除了。"""
         removed = self._tools.pop(name, None)
         if removed is None:
             return False
+        self.invalidate_cache(name)
         logger.info("注销工具: %s", name)
         return True
 
@@ -503,6 +515,77 @@ class ToolManager:
         limited["required"] = [name for name in limited["required"] if name in limited["properties"]]
         return limited
 
+    # ── 缓存 ─────────────────────────────────────────────────────────────────
+
+    @property
+    def cache_size(self) -> int:
+        """当前缓存条目数（含尚未清理的过期条目）。"""
+        return len(self._cache)
+
+    def invalidate_cache(self, name: str | None = None) -> int:
+        """主动失效缓存，返回删除的条目数。
+
+        `name=None` 失效全部工具。版本号在删除前 +1，因此在途请求即使随后
+        成功也不会把旧结果写回（写缓存前会再比较一次版本号）。
+        """
+        if name is None:
+            for tool_name in self._tools:
+                self._cache_versions[tool_name] = self._cache_versions.get(tool_name, 0) + 1
+            removed = len(self._cache)
+            self._cache.clear()
+            return removed
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("name 必须是非空字符串或 None")
+        self._cache_versions[name] = self._cache_versions.get(name, 0) + 1
+        prefix = f"{name}:"
+        keys = [key for key in self._cache if key.startswith(prefix)]
+        for key in keys:
+            del self._cache[key]
+        return len(keys)
+
+    def _cache_key(
+        self,
+        spec: ToolSpec,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        rerank_top_k: int,
+    ) -> str:
+        """与 EchoMind 一致：params + rerank_top_k + context + version 做 MD5。
+
+        EchoMind 的 context 是调用方传入的字典；这里只取 `spec.cache_scope`
+        里的字段（默认 `user_id`），对应 EchoMind 实际传入的 `{"user_id": ...}`。
+        """
+        payload = {
+            "params": arguments,
+            "rerank_top_k": rerank_top_k,
+            "context": {field: getattr(context, field) for field in spec.cache_scope},
+            "version": self._cache_versions.get(spec.name, 0),
+        }
+        digest = hashlib.md5(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        return f"{spec.name}:{digest}"
+
+    def _cache_lookup(self, key: str) -> tuple[Any, bool] | None:
+        """读缓存：过期就删除并返回 None；命中返回 (数据的深拷贝, 是否重排)。"""
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        data, expire_at, reranked = entry
+        if self._clock() < expire_at:
+            return copy.deepcopy(data), reranked
+        del self._cache[key]
+        return None
+
+    def _cache_store(self, key: str, data: Any, ttl: float, reranked: bool = False) -> None:
+        """写缓存：达到上限时按插入顺序删掉最旧的 1/4。"""
+        if len(self._cache) >= self._cache_max_entries:
+            drop = max(1, self._cache_max_entries // 4)
+            for old_key in list(self._cache)[:drop]:
+                del self._cache[old_key]
+        self._cache[key] = (copy.deepcopy(data), self._clock() + ttl, reranked)
+
     # ── 执行 ─────────────────────────────────────────────────────────────────
 
     async def execute(
@@ -519,7 +602,8 @@ class ToolManager:
 
         `deadline` 是 `time.monotonic()` 绝对时间，由 FunctionCallingLoop 传入。
         每次尝试取 `min(tool.timeout_s, deadline - now)`；只有 `retry_safe=True`
-        的工具会按指数退避重试。`use_cache`、`rerank_top_k` 由 T4/T6 接入。
+        的工具会按指数退避重试。缓存顺序为：校验 → 缓存 → （T5 熔断）→ 执行。
+        `rerank_top_k` 由 T6 接入，目前只参与缓存 key。
         """
         if not isinstance(context, ToolContext):
             raise TypeError("context 必须是 ToolContext")
@@ -552,6 +636,28 @@ class ToolManager:
 
         spec = registered.spec
         stats = registered.stats
+        cache_version = self._cache_versions.get(name, 0)
+        cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and spec.supports_rerank else 0
+
+        # 与 EchoMind 一致：缓存命中算一次成功调用，但不产生物理尝试。
+        if use_cache and spec.cache_ttl_s > 0:
+            cached = self._cache_lookup(
+                self._cache_key(spec, arguments, context, cache_rerank_top_k)
+            )
+            if cached is not None:
+                cached_data, cached_reranked = cached
+                stats.total += 1
+                stats.success += 1
+                stats.cache_hits += 1
+                return ToolResult(
+                    tool_name=name,
+                    success=True,
+                    usable=True,
+                    data=cached_data,
+                    cached=True,
+                    reranked=cached_reranked,
+                )
+
         started = self._clock()
         stats.total += 1
 
@@ -603,7 +709,7 @@ class ToolManager:
                 stats.success += 1
                 stats.consecutive_fails = 0
                 stats.total_latency_ms += latency_ms
-                return ToolResult(
+                result = ToolResult(
                     tool_name=name,
                     success=True,
                     usable=True,
@@ -611,6 +717,18 @@ class ToolManager:
                     attempts=attempts,
                     latency_ms=latency_ms,
                 )
+                # 与 EchoMind 一致：缓存最终结果；版本变化则不回填。
+                if (
+                    use_cache
+                    and spec.cache_ttl_s > 0
+                    and cache_version == self._cache_versions.get(name, 0)
+                ):
+                    self._cache_store(
+                        self._cache_key(spec, arguments, context, cache_rerank_top_k),
+                        data,
+                        spec.cache_ttl_s,
+                    )
+                return result
 
             if not last_retryable or not spec.retry_safe or attempts >= max_attempts:
                 break
@@ -708,13 +826,15 @@ class ToolManager:
         }
 
     def fork(self) -> "ToolManager":
-        """复制注册表，隔离统计和熔断状态；供评测/测试使用。"""
+        """复制注册表，隔离统计、熔断与缓存；供评测/测试使用。"""
         other = type(self)(
             self._reranker,
             clock=self._clock,
             sleep=self._sleep,
             max_schema_hint_chars=self._max_schema_hint_chars,
+            cache_max_entries=self._cache_max_entries,
         )
+        other._cache_versions = {}
         for name, registered in self._tools.items():
             other._tools[name] = RegisteredTool(
                 spec=registered.spec,

@@ -63,7 +63,7 @@ def test_tool_spec_defaults():
     assert spec.timeout_s == 3.0
     assert spec.max_retries == 1
     assert spec.retry_backoff_s == 0.1
-    assert spec.cache_ttl_s == 30.0
+    assert spec.cache_ttl_s == 0.0
     assert spec.cache_scope == ("user_id",)
     assert spec.retry_safe is True
     assert spec.supports_rerank is False
@@ -384,7 +384,8 @@ async def test_execute_propagates_cancellation_without_marking_failure():
 
 
 def test_get_stats_uses_injected_clock():
-    ticks = iter([10.0, 10.25])
+    # 第 3 个值供 T4 写缓存时计算 expires_at 使用。
+    ticks = iter([10.0, 10.25, 10.25])
     manager = ToolManager(clock=lambda: next(ticks))
     manager.register(make_spec())
 
