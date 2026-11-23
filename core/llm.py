@@ -83,6 +83,30 @@ def _tool_options(
     return options
 
 
+def _tools_unsupported(exc: Exception, tools: Any) -> bool:
+    """只识别明确的协议能力拒绝，普通参数、鉴权或服务故障不能触发回退。"""
+    if not tools or getattr(exc, "status_code", None) not in {400, 422, 501}:
+        return False
+    body = getattr(exc, "body", None)
+    detail = (str(getattr(exc, "message", "")) + " " + str(body)).lower()
+    if any(marker in detail for marker in ("input_schema", "input schema", "tool_use_id", "tools[", "tools.")):
+        return False
+    if "tool_choice" in detail and "none" in detail and any(
+        marker in detail for marker in ("input should be", "must be one of", "invalid enum", "cannot be")
+    ):
+        return True
+    return any(key in detail for key in (
+        "tools", "tool_choice", "tool use", "tool_use", "function calling", "function_calling", "function calls",
+    )) and any(
+        marker in detail for marker in (
+            "not supported", "unsupported", "does not support", "not support",
+            "unrecognized", "unknown field", "unknown parameter", "unknown argument",
+            "extra inputs are not permitted", "not implemented", "不支持",
+            "unexpected keyword", "tools are not allowed", "tool_choice is not allowed",
+        )
+    )
+
+
 def _parse_message_turn(response: Any) -> MessageTurn:
     content: list[dict[str, Any]] = []
     tool_uses: list[ToolUse] = []
@@ -117,6 +141,10 @@ def _parse_message_turn(response: Any) -> MessageTurn:
                 or stop_reason == "max_tokens"
             ):
                 raise LLMError("模型返回了无效的工具调用", status_code=502, code="tool_protocol_error")
+            try:
+                json.dumps(arguments, allow_nan=False)
+            except (ValueError, TypeError, RecursionError):
+                raise LLMError("工具参数不是合法 JSON", status_code=502, code="tool_protocol_error") from None
             ids.add(call_id)
             payload["input"] = deepcopy(arguments)
             tool_uses.append(ToolUse(call_id, name, deepcopy(arguments)))
@@ -125,6 +153,8 @@ def _parse_message_turn(response: Any) -> MessageTurn:
     text = extract_text_content(content)
     if stop_reason == "tool_use" and not tool_uses:
         raise LLMError("模型未返回工具调用块", status_code=502, code="tool_protocol_error")
+    if tool_uses and stop_reason != "tool_use":
+        raise LLMError("工具调用的停止原因非法", status_code=502, code="tool_protocol_error")
     if not text and not tool_uses:
         raise LLMError("模型返回了空内容，请稍后重试", status_code=502, code="llm_empty_response")
     return MessageTurn(content, text, tuple(tool_uses), stop_reason, *_usage_tokens(_field(response, "usage")))
@@ -260,12 +290,16 @@ class LLMClient:
         except anthropic.NotFoundError as ex:
             raise LLMError("模型或接口地址不存在，请检查配置", status_code=502, code="llm_not_found") from ex
         except anthropic.BadRequestError as ex:
+            if _tools_unsupported(ex, tools):
+                raise LLMError("上游不支持当前工具协议", status_code=502, code="tool_protocol_unsupported") from ex
             raise LLMError("模型请求参数错误，请检查配置和消息内容", status_code=502, code="llm_bad_request") from ex
         except anthropic.RateLimitError as ex:
             raise LLMError("模型服务限流，请稍后重试", status_code=503, code="llm_rate_limited") from ex
         except anthropic.APIConnectionError as ex:
             raise LLMError("无法连接模型服务，请检查网络", status_code=503, code="llm_connection_failed") from ex
         except anthropic.APIStatusError as ex:
+            if _tools_unsupported(ex, tools):
+                raise LLMError("上游不支持当前工具协议", status_code=502, code="tool_protocol_unsupported") from ex
             raise LLMError("模型服务返回错误，请稍后重试", status_code=502, code="llm_upstream_error") from ex
         except anthropic.APIError as ex:
             raise LLMError("模型服务异常，请稍后重试", status_code=502, code="llm_api_error") from ex
@@ -353,6 +387,8 @@ class LLMClient:
                 code="llm_not_found",
             ) from ex
         except anthropic.BadRequestError as ex:
+            if _tools_unsupported(ex, options.get("tools")):
+                raise LLMError("上游不支持当前工具协议", status_code=502, code="tool_protocol_unsupported") from ex
             raise LLMError(
                 "模型请求参数错误，请检查 ANTHROPIC_MODEL 和消息内容",
                 status_code=502,
@@ -371,6 +407,8 @@ class LLMClient:
                 code="llm_connection_failed",
             ) from ex
         except anthropic.APIStatusError as ex:
+            if _tools_unsupported(ex, options.get("tools")):
+                raise LLMError("上游不支持当前工具协议", status_code=502, code="tool_protocol_unsupported") from ex
             raise LLMError(
                 "模型服务返回错误，请稍后重试",
                 status_code=502,
