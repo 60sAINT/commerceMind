@@ -147,6 +147,25 @@ async def test_recognized_entities_are_passed_to_current_request_tools(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_billing_tool_reads_current_order_fields_and_drops_them_on_order_change(memory_env):
+    _, memory = memory_env
+    llm = FakeLLM(name="check_billing_fields", arguments={})
+    app = make_app(llm, memory=memory)
+
+    await chat_stream(app, body("A123 要退款，金额 99 元，昨天用微信付的", "r1"))
+    await chat_stream(app, body("继续处理这笔退款", "r2"))
+    reply = json.loads(llm.finals[-1]["messages"][-1]["content"][0]["content"])
+    assert all(reply["data"]["fields"].values())
+    assert reply["data"]["can_confirm_refund"] is False
+
+    await chat_stream(app, body("换成 B456，查退款", "r3"))
+    reply = json.loads(llm.finals[-1]["messages"][-1]["content"][0]["content"])
+    assert reply["data"]["fields"] == {
+        "order_id": True, "amount": False, "date": False, "payment_channel": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_only_final_answer_is_persisted_and_replay_skips_tools(memory_env):
     store, memory = memory_env
     llm = FakeLLM()

@@ -8,7 +8,7 @@ flowchart TD
     OUTER --> B[获取会话锁]
     B --> C[Redis 读取 working、summary、state]
     C --> D[组装回答上下文]
-    D --> E[可选意图识别，得到本轮新 state]
+    D --> E[识别意图并合并当前业务 state]
     E --> F[LLM 流式生成，逐段发送 delta]
     F --> G{生成完整且非空？}
     G -->|否| STOP[结束或报错，本轮不进入正常记忆提交]
@@ -64,7 +64,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | working memory | 用户 + 会话 | 尚未压缩的完整 Turn | Redis List |
 | summary | 用户 + 会话 | 更早对话的累计摘要 | Redis String |
-| state | 用户 + 会话 | 当前结构化状态，目前主要是意图识别结果 | Redis String，内容是 JSON |
+| state | 用户 + 会话 | 当前识别结果与客服任务的结构化字段 | Redis String，内容是 JSON |
 | episode | 某一段历史对话 | 本次压缩段的脱敏摘要、来源信息、向量 | Redis 待办 → Chroma |
 | user profile | 用户 | 长期偏好、关注商品类别、咨询类别及语义向量 | Chroma |
 
@@ -156,7 +156,7 @@ return f"{system}\n\n{memory}" if system else memory
 system：
   基础客服说明 + 启用时的 Skill 内容
   + summary：T1～T3 的历史摘要
-  + 本轮计算得到的 state（符合下面的注入条件时）
+  + 本轮识别结果及与当前任务相关的结构化字段
 
 messages：
   user      T4 问题
@@ -168,37 +168,69 @@ messages：
 
 这样当前问题只出现一次，最近讨论的材料保持原文，更早的购买信息由摘要补充。若 Redis 上下文读取异常，当前 API 会尝试单独读取 state，再以无历史方式继续；不会自动替换为长期检索。
 
-### 3.4 state 在本轮什么时候更新
+### 3.4 会话状态：先读旧 state，本轮识别成功后再提交新 state
 
-state 是当前会话的结构化数据，最直接的例子是退款意图：
+#### 第一步：查回执，在会话锁内读取旧状态
+
+在 [api/main.py 的 `events()`](../api/main.py) 中，同一个 `client_request_id` 命中已保存的回执时，接口直接回放原回答。真正的新一轮在会话锁内调用 `memory.read_context()`，从 Redis 的快照取出 `working`、`summary` 和 `state`，再复制出请求内的 `state` 字典。读取完整上下文失败时，API 会尝试单独调用 `store.get_state()`。正常读到空字典代表该会话还没有状态，可以从空状态开始。两种读取都失败时，API 仍可继续回答，但本轮没有可用于合并和提交的状态快照。
+
+`state` 是按 `user_id + session_id` 隔离的 JSON 对象。`state.intent` 保存现有识别结果，`state.business` 保存当前客服任务。前者的结构和识别流程沿用现有实现。旧会话只有 `intent` 时，`merge_business_state()` 从空业务任务开始。状态的读取入口在 [memory/context.py 的 `ContextBuilder.get_context()`](../memory/context.py)，Redis 键和快照读取在 [memory/store.py 的 `state_key()` 和 `get_snapshot()`](../memory/store.py)。
+
+#### 第二步：识别之后，生成本轮的业务状态候选
+
+API 拿到本轮 intent 结果后，调用 [core/conversation_state.py 的 `merge_business_state()`](../core/conversation_state.py)。它接收旧 `business`、本轮文本、现有 intent 类别和服务端 `request_id`。例如用户说「A123 要退款，金额 99 元」，合并阶段会填上退款任务、当前订单和金额。等本轮回复发出补问并成功提交后，`state.business` 如下所示。这里用 `req-1` 简写服务端请求 ID。
 
 ```json
 {
-  "intent": {
-    "intent": "refund",
-    "confidence": 0.91,
-    "source": "llm",
-    "source_scores": {"llm": 0.91},
-    "entities": {},
-    "reasoning": "用户正在咨询退款"
-  }
+  "domain": "commerce",
+  "task": "refund",
+  "subject": {"type": "order", "id": "A123"},
+  "fields": {
+    "order_id": {"value": "A123", "source": "user_message", "request_id": "req-1"},
+    "amount": {"value": "99", "source": "user_message", "request_id": "req-1"}
+  },
+  "pending": {"fields": ["date", "payment_channel"], "asked_request_id": "req-1"}
 }
 ```
 
-外层 `intent` 是 state 中的字段名，内层 `intent` 是分类结果。API 先复制旧 state，然后将本轮识别结果覆盖到这个字段（`api/main.py:609～625`）：
+| 字段 | 类型和取值 | 从哪里来、什么时候改变 |
+| --- | --- | --- |
+| `domain` | 固定字符串 `commerce`、`technical`、`account` | 由代码中的 `_TASK_DOMAINS` 从任务类型映射。明确跨域时替换旧域并清空旧业务字段。 |
+| `task` | 固定字符串 `order_status`、`logistics`、`refund`、`invoice`、`payment_issue`、`technical`、`account` | 先看本轮文本里的业务线索，再参考现有 intent 类别。短回复可以续用旧任务。前五种任务都属于 `commerce`。问候、投诉、转人工等类别没有单独的业务任务值。 |
+| `subject` | `null` 或 `{"type": "order", "id": "..."}` | `type` 目前只有 `order`。`id` 从本轮合并后的 `fields.order_id.value` 派生。换单、撤回订单号或多个单号有歧义时，旧订单对象会被清除。 |
+| `fields` | 字段名到 `{value, source, request_id}` 的映射，可为空 | `value` 是字符串。`source` 目前固定为 `user_message`，`request_id` 指向提供该值的服务端请求。沿用旧值会保留它的来源，确认新值才改写这一项。 |
+| `pending` | `null` 或 `{"fields": [...], "asked_request_id": "..."}` | `fields` 是已问过、仍缺少的字段名。`asked_request_id` 指向发出该补问的服务端请求。补齐后从列表移除，任务切换时重新计算。 |
 
-```python
-intent_result = await _recognize_intent(
-    req.message, llm, intent_settings, history=intent_history,
-)
-if state is not None:
-    state["intent"] = intent_result.to_state()
-    state_for_commit = state
-```
+`_DOMAIN_FIELDS` 限定每个业务域可以保存的字段。`_extract_fields()` 只处理当前消息中能匹配到的值。关闭意图识别时，像「退款」「物流」「登录报 401」这样的明确线索仍可建立任务。
 
-此时只更新请求内的 Python 字典，不立即修改 Redis。回答成功后，state 才与完整 Turn 一起提交；模型生成失败时，不会留下已经推进但没有对应回答的本轮意图。
+| 业务域 | 字段 | 值如何产生 |
+| --- | --- | --- |
+| `commerce` | `order_id` | 从带「订单号」等标签的文本、`A123` 或 `A-123` 这类字母数字编号中提取，统一转成大写。补问订单号后也接受单独的数字编号。 |
+| `commerce` | `amount` | 「99 元」或「金额 99.50」会提取为字符串 `"99"` 或 `"99.50"`。待补项有金额且无待补订单号时，也接受只回复数字。 |
+| `commerce` | `date` | 完整有效日期统一为 `YYYY-MM-DD`。只有月日或「昨天」这类相对日期时，保存原表达。相对日期对应用户提供该字段的那一轮。 |
+| `commerce` | `payment_channel` | 固定值为「微信」「支付宝」「银行卡」「银联」「现金」。例如「信用卡」归入「银行卡」。 |
+| `technical` | `error_code` | 提取 `4xx` 或 `5xx` 的三位 HTTP 错误码，保存为字符串，如 `"401"`。 |
+| `account` | 暂无 | 可以记录当前任务属于账号问题。 |
 
-当前 API 只有在本轮识别成功、设置 `state_for_commit` 后，才把整个 state 追加到 system。关闭意图识别或识别失败时，读到了旧 state 不等于一定注入模型。state 与画像的作用域也不同：前者属于当前会话，后者属于用户。
+同一任务内逐项合并。比如「金额记错了，是 69 元」更新 `amount`，原订单和支付渠道继续有效。「撤回金额」删除这一项。若用户从查 A123 物流改为问 A123 退款，仍属于同一订单，`task` 改成 `refund`，已知字段继续沿用。若改成「换成 B456」或「查另一单」，先清理旧订单的字段和待补项，再按新对象处理。两个不同订单号同时出现时，接口先发「请确认这次要处理的唯一订单号。」等到用户选定再继续。明确换话题或结束当前任务时，清掉旧任务。单独一句「谢谢」可以保留旧任务供后续接着聊，本轮不使用旧业务字段。
+
+#### 第三步：把当前字段交给回复和工具，发出需要的补问
+
+`BusinessTurn.prompt_data()` 只投影本轮相关的 `domain`、`task`、`subject` 和字段值，API 把这份数据加入回复模型的 system。`BusinessTurn.entities()` 把值转成工具原有的 `dict[str, list[str]]` 形状。例如 `{"order_id": ["A123"], "payment_channel": ["微信"]}`。当 Function Calling 分支执行时，工具通过 `ToolContext.entities` 读取这些字段。账单工具可以据此发现支付渠道已经补齐。当前工具核对的是字段是否齐全。相关读取见 [api/main.py 的 `generate()`](../api/main.py) 和 [tooling/commerce_tools.py 的 `check_billing_fields()`](../tooling/commerce_tools.py)。
+
+具体订单场景里，`_REQUIRED_FIELDS` 给查单、物流和发票任务配置 `order_id`，给退款和支付问题配置 `order_id`、`amount`、`date`、`payment_channel`。例如只问「退款一般多久到账」时可以直接回答政策。有具体订单或已有待补事项时，`BusinessTurn.question()` 才会生成字段补问。正常回复流结束后，API 把补问作为最后一段 SSE `delta` 发出。多个订单有歧义时，直接发送确定性的澄清问题。`BusinessTurn.after_reply()` 用本轮真正发出的补问记录 `pending`，所以用户下轮只说「微信」，也能知道是在补支付渠道。
+
+#### 第四步：回复成功后，和完整一轮一起提交
+
+到这一步之前，候选 `business` 只在本次请求中。API 检查回复非空、连接仍有效、工具循环成功且本轮不是回放，再把结果放进 `state_for_commit`。如果用户已经明确结束任务，会移除 `business`。启用了 PostgreSQL 会话库时，先由 `SessionRepository.commit_turn()` 把携带的 state 快照放进助手消息的 metadata。随后由 `ConversationMemory.commit()` 调用 `RedisMemoryStore.commit_turn()`，在同一个 Redis 事务里保存完整 Turn、可用的回执和新 state，并刷新会话 TTL。下轮对话仍从 Redis 读取会话状态。生成失败、提交前断连和重试回放不会推进业务状态。参见 [api/sessions.py 的 `commit_turn()`](../api/sessions.py) 和 [memory/store.py 的 `commit_turn()`](../memory/store.py)。
+
+| 轮次 | 用户说什么 | 成功提交后的变化 |
+| --- | --- | --- |
+| T1 | 「A123 要退款，金额 99 元」 | `domain=commerce`，`task=refund`，记住 A123 和 99 元。补问日期和支付渠道。 |
+| T2 | 「微信」 | 只新增支付渠道，金额的来源仍是 T1。继续补问日期。 |
+| T3 | 「换成 B456，查下物流」 | `task=logistics`。先清理原退款任务的数据，再写入 B456。物流需要的订单号已经齐全，`pending=null`。 |
+| T4 | 「登录报 401」 | 切换到 `technical`，订单字段清空，保存 `error_code="401"`。 |
+| T5 | 「重登过了，还是不行」 | 续接技术任务，本轮可以使用 401。字段的来源仍然是 T4。 |
 
 ### 3.5 流式输出结束后，才保存完整 Turn
 

@@ -127,6 +127,93 @@ async def test_second_turn_reads_first_turn(memory_env):
 
 
 @pytest.mark.asyncio
+async def test_business_state_fills_pending_changes_orders_and_replays(memory_env):
+    store, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM()
+    app.state.llm = llm
+
+    first = await chat_stream(app, chat_body("A123 要退款，金额 99 元", request_id="r1"))
+    business = (await store.get_state("u1", "c1"))["business"]
+    assert business["pending"] == {
+        "fields": ["date", "payment_channel"], "asked_request_id": first.done["request_id"],
+    }
+    assert "请补充交易日期、支付渠道。" in first.text
+    assert business["fields"]["amount"] == {
+        "value": "99", "source": "user_message", "request_id": first.done["request_id"],
+    }
+
+    second = await chat_stream(app, chat_body("微信", request_id="r2"))
+    assert "请补充交易日期。" in second.text
+    assert '"payment_channel": "微信"' in llm.calls[-1]["system"]
+    await chat_stream(app, chat_body("金额记错了，是 69 元", request_id="r3"))
+    state = (await store.get_state("u1", "c1"))["business"]
+    assert state["subject"] == {"type": "order", "id": "A123"}
+    assert state["fields"]["amount"]["value"] == "69"
+    assert state["fields"]["payment_channel"]["request_id"] == second.done["request_id"]
+
+    await chat_stream(app, chat_body("换成 B456，查下物流", request_id="r4"))
+    changed = (await store.get_state("u1", "c1"))["business"]
+    assert changed["task"] == "logistics"
+    assert changed["subject"] == {"type": "order", "id": "B456"}
+    assert set(changed["fields"]) == {"order_id"}
+    assert changed["pending"] is None
+    assert "A123" not in llm.calls[-1]["system"]
+    call_count = len(llm.calls)
+    replay = await chat_stream(app, chat_body("微信", request_id="r2"))
+    assert replay.text == second.text
+    assert len(llm.calls) == call_count
+    assert (await store.get_state("u1", "c1"))["business"] == changed
+
+
+@pytest.mark.asyncio
+async def test_business_state_clarifies_ambiguous_order_without_using_previous_order(memory_env):
+    store, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM()
+    app.state.llm = llm
+
+    await chat_stream(app, chat_body("查 A123 的物流", request_id="r1"))
+    response = await chat_stream(app, chat_body("查订单 123 和 456 的物流", request_id="r2"))
+    assert response.text == "请确认这次要处理的唯一订单号。"
+    assert len(llm.calls) == 1
+    business = (await store.get_state("u1", "c1"))["business"]
+    assert business["subject"] is None
+    assert business["fields"] == {}
+    assert business["pending"]["fields"] == ["order_id"]
+    await chat_stream(app, chat_body("456", request_id="r3"))
+    business = (await store.get_state("u1", "c1"))["business"]
+    assert business["subject"] == {"type": "order", "id": "456"}
+    assert business["pending"] is None
+
+
+@pytest.mark.asyncio
+async def test_business_state_technical_followup_does_not_cross_domains_or_commit_on_failure(memory_env):
+    store, service = memory_env
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM()
+    app.state.llm = llm
+
+    await chat_stream(app, chat_body("登录报 401", request_id="r1"))
+    await chat_stream(app, chat_body("谢谢", request_id="r2"))
+    assert '"error_code": "401"' not in llm.calls[-1]["system"]
+    await chat_stream(app, chat_body("重登过了，还是不行", request_id="r3"))
+    assert '"error_code": "401"' in llm.calls[-1]["system"]
+
+    saved = await store.get_state("u1", "c1")
+    llm.error = LLMError("offline")
+    response = await chat_stream(app, chat_body("帮我查下物流", request_id="r4"))
+    assert not response.done
+    assert await store.get_state("u1", "c1") == saved
+    llm.error = None
+    await chat_stream(app, chat_body("帮我查下物流", request_id="r4"))
+    assert '"error_code": "401"' not in llm.calls[-1]["system"]
+    assert (await store.get_state("u1", "c1"))["business"]["fields"] == {}
+    await chat_stream(app, chat_body("问题解决了", request_id="r5"))
+    assert "business" not in await store.get_state("u1", "c1")
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_persists_intent_atomically_with_successful_turn(
     memory_env, monkeypatch,
 ):

@@ -100,7 +100,7 @@ def check_billing_fields(req: ToolContext, args: dict[str, Any]) -> dict[str, An
         "order_id": bool(req.entities.get("order_id")),
         "amount": bool(req.entities.get("amount")),
         "date": bool(req.entities.get("date")),
-        "payment_channel": bool(args.get("payment_channel")),
+        "payment_channel": bool(req.entities.get("payment_channel") or args.get("payment_channel")),
     }
     return {
         "fields": fields,
