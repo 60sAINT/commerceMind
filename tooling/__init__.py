@@ -1,5 +1,6 @@
 """CommerceMind tooling package."""
 from tooling.errors import ToolError, ToolErrorCode, ToolValidationError
+from tooling.reranker import LLMReranker, Reranker, build_reranker
 from tooling.tool_manager import (
     CircuitBreaker,
     CircuitState,
@@ -16,7 +17,9 @@ from tooling.tool_manager import (
 __all__ = [
     "CircuitBreaker",
     "CircuitState",
+    "LLMReranker",
     "RegisteredTool",
+    "Reranker",
     "ToolContext",
     "ToolError",
     "ToolErrorCode",
@@ -26,5 +29,6 @@ __all__ = [
     "ToolSpec",
     "ToolStats",
     "ToolValidationError",
+    "build_reranker",
     "validate_params",
 ]

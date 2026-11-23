@@ -1,7 +1,7 @@
 """进程内工具管理器：工具契约、注册表与统一执行入口。
 
 T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验，T3 接入超时与重试，
-T4 接入 TTL 缓存，T5 接入熔断与降级：
+T4 接入 TTL 缓存，T5 接入熔断与降级，T6 接入结果重排：
 
 - `ToolContext` / `ToolSpec` / `ToolResult` / `ToolStats` / `CircuitState`；
 - `ToolManager.register()` / `unregister()` / `definitions()` / `get_stats()` / `fork()`；
@@ -10,7 +10,6 @@ T4 接入 TTL 缓存，T5 接入熔断与降级：
 - `invalidate_cache()` 通过版本号同时实现主动失效与在途结果不回填。
 
 缓存结构与 EchoMind 保持一致：进程内字典、`工具名 + MD5` 键、`(数据, 过期时间, 是否重排)` 值。
-重排在 T6 接入；
 本模块不依赖 FastAPI，也不依赖具体 LLM 或业务工具，可被脚本、测试、评测直接复用。
 """
 from __future__ import annotations
@@ -34,6 +33,7 @@ from jsonschema import ValidationError, validators
 from jsonschema.exceptions import SchemaError
 
 from tooling.errors import ToolError, ToolErrorCode, ToolValidationError
+from tooling.reranker import Reranker
 
 logger = logging.getLogger(__name__)
 
@@ -425,7 +425,7 @@ class ToolManager:
 
     def __init__(
         self,
-        reranker: Any | None = None,
+        reranker: Reranker | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_schema_hint_chars: int = 800,
@@ -634,7 +634,7 @@ class ToolManager:
         每次尝试取 `min(tool.timeout_s, deadline - now)`；只有 `retry_safe=True`
         的工具会按指数退避重试和使用缓存。熔断到恢复时间时跳过缓存读取，
         让一个请求执行半开探测。
-        `rerank_top_k` 由 T6 接入，目前只参与缓存 key。
+        `rerank_top_k` 大于 0 时，支持重排的工具可以对成功返回的列表选取 Top-K。
         """
         if not isinstance(context, ToolContext):
             raise TypeError("context 必须是 ToolContext")
@@ -669,9 +669,9 @@ class ToolManager:
         stats = registered.stats
         cache_key = None
         cache_version = self._cache_versions.get(name, 0)
+        top_k = rerank_top_k if rerank_top_k > 0 and spec.supports_rerank else 0
         if use_cache and spec.retry_safe and spec.cache_ttl_s > 0:
-            cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and spec.supports_rerank else 0
-            cache_key = self._cache_key(spec, arguments, context, cache_rerank_top_k)
+            cache_key = self._cache_key(spec, arguments, context, top_k)
 
         # 缓存命中算一次成功调用。到达恢复时间时，给实际调用留出探测机会。
         if cache_key is not None and not registered.breaker.recovery_due:
@@ -714,13 +714,18 @@ class ToolManager:
 
             if result.success:
                 breaker.record_success(generation)
+                stats.consecutive_fails = breaker.fail_count
+                cacheable = await self._apply_rerank(
+                    result, arguments.get(spec.rerank_query_field), top_k, spec, deadline,
+                )
                 stats.success += 1
                 if (
-                    generation == breaker.generation
+                    cacheable
+                    and generation == breaker.generation
                     and cache_key is not None
                     and cache_version == self._cache_versions.get(name, 0)
                 ):
-                    self._cache_store(cache_key, result.data, spec.cache_ttl_s)
+                    self._cache_store(cache_key, result.data, spec.cache_ttl_s, result.reranked)
             elif result.error_code is not None and result.error_code in _DEPENDENCY_FAILURE_MESSAGES:
                 breaker.record_failure(generation)
                 failure = ToolFailure(
@@ -833,6 +838,45 @@ class ToolManager:
             error=last_error,
             retryable=last_retryable and spec.retry_safe,
         )
+
+    async def _apply_rerank(
+        self,
+        result: ToolResult,
+        query: Any,
+        top_k: int,
+        spec: ToolSpec,
+        deadline: float | None,
+    ) -> bool:
+        """尝试重排，返回最终结果是否适合写缓存。"""
+        items = result.data
+        reranker = self._reranker
+        if (
+            reranker is None or top_k <= 0 or not isinstance(items, list) or len(items) <= top_k
+            or not isinstance(query, str) or not query.strip()
+        ):
+            return True
+
+        timeout = self._attempt_timeout(spec, deadline)
+        if timeout > 0:
+            try:
+                async with asyncio.timeout(timeout):
+                    order = await reranker.rerank(query, copy.deepcopy(items), top_k)
+                if not isinstance(order, list) or not order or any(
+                    type(index) is not int or not 0 <= index < len(items) for index in order
+                ):
+                    raise ValueError("重排索引必须是非空、有效的整数列表")
+            except Exception as exc:
+                logger.warning("工具重排失败: %s (%s)", spec.name, type(exc).__name__)
+            else:
+                # 重复索引只取一次，缺少的候选按原序补齐。
+                selected = dict.fromkeys(order)
+                selected.update(dict.fromkeys(range(len(items))))
+                result.data = [items[index] for index in selected][:top_k]
+                result.reranked = True
+                return True
+
+        result.data = items[:top_k]
+        return False
 
     async def _apply_fallback(
         self,
