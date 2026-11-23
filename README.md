@@ -380,3 +380,30 @@ JSON 文件接口保留兼容既有调用，前端不再展示编辑入口。编
 此机制由显式请求触发，无目录监听器；进程内锁不覆盖多 worker 或外部程序直接改文件。
 
 验证：`python -m pytest -q tests/test_skill_api.py tests/test_skill_loader.py tests/test_skill_content.py`。
+
+## 工具调用可观测性
+
+设置 `COMMERCEMIND_TOOLS_DEBUG=true` 后，提供以下只读接口；关闭时不注册路由：
+
+- `GET /tools/stats`：注册状态、缓存条数、各工具执行统计与 Function Calling 汇总；
+- `GET /metrics`：Prometheus 文本指标，不需要额外监控依赖。
+
+```bash
+curl http://localhost:8000/tools/stats
+curl http://localhost:8000/metrics
+```
+
+工具统计区分逻辑调用、物理尝试、重试、参数拒绝、超时、熔断拒绝、降级和取消。
+参数拒绝单独计数，不加入逻辑调用 total；缓存命中算逻辑成功，不增加 attempts。
+failed 表示主路径失败，因此降级有数据时仍增加 failed；取消发生在降级期间时也可能同时记录主路径失败。
+平均延迟沿用执行层累计口径；P95 使用最近 256 次观测（包括缓存命中、参数拒绝和取消）的实际等待时间，采用 nearest-rank 算法。
+Function Calling 另汇总成功、失败、取消、提前关闭、轮数、调用数、修复次数和协议回退次数。
+token 指标仅覆盖非流式工具阶段，未包含意图识别、重排和最终流式回答。
+
+这些指标是进程内累计值，重启后清零，多 worker 需分别采集。工具注销后清除对应样本，评测 fork 不继承线上计数。
+读取指标不会调用工具、清理缓存或占用半开探测名额；缓存条数包含尚未惰性清理的过期条目。
+SSE done 额外提供 `tool_loop_latency_ms`，涵盖工具循环与最终回答。
+
+日志中的 `tool_call`、`tool_result` 和 `function_calling_completed` 均可通过 SSE meta 的 request_id 关联。
+聚合快照不保存请求 ID；日志和指标不包含用户/会话身份、消息、工具参数、结果正文或异常详情。
+Prometheus 标签只使用已注册工具名、固定错误码和固定状态，不使用用户提供的名称。

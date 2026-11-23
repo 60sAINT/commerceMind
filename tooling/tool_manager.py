@@ -31,6 +31,7 @@ from typing import Any
 
 from jsonschema import ValidationError, validators
 from jsonschema.exceptions import SchemaError
+from monitor.tool_monitor import ToolMonitor
 
 from tooling.errors import ToolError, ToolErrorCode, ToolValidationError
 from tooling.reranker import Reranker
@@ -332,6 +333,7 @@ class ToolStats:
     retries: int = 0  # 重试次数（T3）
     circuit_rejections: int = 0
     degraded: int = 0
+    cancelled: int = 0
     total_latency_ms: float = 0.0
     consecutive_fails: int = 0
 
@@ -465,6 +467,7 @@ class ToolManager:
         self._cache_max_entries = cache_max_entries
         self._cache: dict[str, tuple[Any, float, bool]] = {}
         self._cache_versions: dict[str, int] = {}
+        self.monitor = ToolMonitor()
         # 复用状态机的参数校验，即使注册表暂时为空也能发现配置错误。
         breaker = CircuitBreaker(circuit_failure_threshold, circuit_recovery_s, clock)
         self._circuit_failure_threshold = breaker.threshold
@@ -483,6 +486,7 @@ class ToolManager:
             spec=tool,
             breaker=CircuitBreaker(self._circuit_failure_threshold, self._circuit_recovery_s, self._clock),
         )
+        self.monitor.register(tool.name)
         logger.info("注册工具: %s", tool.name)
 
     def unregister(self, name: str) -> bool:
@@ -491,6 +495,7 @@ class ToolManager:
         if removed is None:
             return False
         self.invalidate_cache(name)
+        self.monitor.unregister(name)
         logger.info("注销工具: %s", name)
         return True
 
@@ -635,6 +640,53 @@ class ToolManager:
     # ── 执行 ─────────────────────────────────────────────────────────────────
 
     async def execute(
+        self,
+        name: str,
+        params: Any,
+        context: ToolContext,
+        *,
+        deadline: float | None = None,
+        use_cache: bool = True,
+        rerank_top_k: int = 0,
+    ) -> ToolResult:
+        """统一观测一次逻辑调用；保留原执行结果、异常和取消语义。"""
+        if not isinstance(context, ToolContext):
+            raise TypeError("context 必须是 ToolContext")
+        started = self._clock()
+        registered = self._tools.get(name)
+        result = None
+        outcome = "error"
+        if registered is not None:
+            self.monitor.start_tool(name)
+        try:
+            result = await self._execute(
+                name, params, context, deadline=deadline, use_cache=use_cache, rerank_top_k=rerank_top_k,
+            )
+            outcome = "success" if result.success else "failed"
+            return result
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            if registered is not None:
+                registered.stats.cancelled += 1
+            raise
+        finally:
+            latency_ms = max(0.0, (self._clock() - started) * 1000)
+            code = result.error_code if result is not None else None
+            if code not in {item.value for item in ToolErrorCode}:
+                code = None
+            if self._tools.get(name) is registered and registered is not None:
+                self.monitor.record_tool(name, latency_ms, code)
+            logger.info("tool_call %s", json.dumps({
+                "request_id": context.request_id, "tool": registered.spec.name if registered else "_unknown",
+                "outcome": outcome, "error_code": code, "latency_ms": round(latency_ms, 3),
+                "attempts": result.attempts if result else None,
+                "cached": result.cached if result else False,
+                "reranked": result.reranked if result else False,
+                "circuit_state": registered.breaker.state.value if registered else None,
+                "usable": result.usable if result else False, "degraded": result.degraded if result else False,
+            }, ensure_ascii=False))
+
+    async def _execute(
         self,
         name: str,
         params: Any,
@@ -973,12 +1025,24 @@ class ToolManager:
                 "retries": registered.stats.retries,
                 "circuit_rejections": registered.stats.circuit_rejections,
                 "degraded": registered.stats.degraded,
+                "cancelled": registered.stats.cancelled,
+                "cache_hit_rate": round(registered.stats.cache_hits / registered.stats.total, 3) if registered.stats.total else 0.0,
                 "success_rate": round(registered.stats.success_rate, 3),
                 "avg_latency_ms": round(registered.stats.avg_latency_ms, 1),
                 "consecutive_fails": registered.stats.consecutive_fails,
                 "circuit_state": registered.breaker.state.value,
+                **self.monitor.tool_snapshot(name),
             }
             for name, registered in sorted(self._tools.items())
+        }
+
+    def get_health(self) -> dict[str, Any]:
+        """只读快照：不尝试调用工具、清理缓存或占用半开探测名额。"""
+        stats = self.get_stats()
+        return {
+            "status": "degraded" if any(s["circuit_state"] != "closed" for s in stats.values()) else "ok",
+            "cache_size": self.cache_size, "tools": stats,
+            "function_calling": self.monitor.loop_snapshot(),
         }
 
     def fork(self) -> "ToolManager":
@@ -994,6 +1058,7 @@ class ToolManager:
         )
         other._cache_versions = {}
         for name, registered in self._tools.items():
+            other.monitor.register(name)
             other._tools[name] = RegisteredTool(
                 spec=registered.spec,
                 breaker=CircuitBreaker(

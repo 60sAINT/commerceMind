@@ -43,6 +43,7 @@ class FunctionCallingResult:
     error_code: str | None = None
     repairs: int = 0
     protocol_fallback: bool = False
+    latency_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +123,48 @@ class FunctionCallingLoop:
         system: str | None = None,
         allowed_tools: Sequence[str] | None = None,
     ) -> AsyncIterator[FunctionCallingEvent]:
+        """聚合一次请求的完成/失败/取消状态，不保存请求正文和工具数据。"""
+        started = self._clock()
+        result = FunctionCallingResult()
+        outcome = "aborted"
+        self._manager.monitor.start_loop()
+        try:
+            async with aclosing(self._stream(
+                message, context, history=history, system=system, allowed_tools=allowed_tools, result=result,
+            )) as events:
+                async for event in events:
+                    if event.type == "done":
+                        result.latency_ms = max(0.0, (self._clock() - started) * 1000)
+                        outcome = "success" if result.success else "failed"
+                        event = FunctionCallingEvent("done", asdict(result))
+                    yield event
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception:
+            outcome = "failed"
+            raise
+        finally:
+            if outcome not in {"success", "failed"} or result.latency_ms == 0:
+                result.latency_ms = max(0.0, (self._clock() - started) * 1000)
+            self._manager.monitor.record_loop(outcome, result.latency_ms, asdict(result))
+            logger.info("function_calling_completed %s", _json({
+                "request_id": context.request_id, "outcome": outcome,
+                "latency_ms": round(result.latency_ms, 3), "calls": result.calls,
+                "rounds": result.rounds, "repairs": result.repairs,
+                "protocol_fallback": result.protocol_fallback, "error_code": result.error_code,
+            }))
+
+    async def _stream(
+        self,
+        message: str,
+        context: ToolContext,
+        *,
+        history: Sequence[dict[str, Any]] | None = None,
+        system: str | None = None,
+        allowed_tools: Sequence[str] | None = None,
+        result: FunctionCallingResult,
+    ) -> AsyncIterator[FunctionCallingEvent]:
         """工具阶段非流式，直接回答不重请求，收尾回答使用最终流式请求。"""
         messages = copy.deepcopy(_build_messages(message, history))
         definitions = self._manager.definitions()
@@ -131,7 +174,6 @@ class FunctionCallingLoop:
             allowed = frozenset(allowed_tools)
             definitions = [item for item in definitions if item["name"] in allowed]
         allowed = frozenset(item["name"] for item in definitions)
-        result = FunctionCallingResult()
         base_system = system or SYSTEM_PROMPT
         tool_system = base_system + "\n" + _TOOL_POLICY
         seen: set[str] = set()
@@ -243,6 +285,14 @@ class FunctionCallingLoop:
                             ),
                         }
                         result.tool_traces.append(trace)
+                        logger.info("tool_result %s", _json({
+                            "request_id": context.request_id,
+                            "tool": spec.name if spec is not None else "_unknown",
+                            "success": tool_result.success, "usable": tool_result.usable,
+                            "degraded": tool_result.degraded, "cached": tool_result.cached,
+                            "error_code": tool_result.error_code, "attempts": tool_result.attempts,
+                            "latency_ms": round(tool_result.latency_ms, 3),
+                        }))
                         if self._settings.stream_events:
                             yield FunctionCallingEvent("tool_end", copy.deepcopy(trace))
                     # 每个 tool_use（含被拒绝的调用）都有对应结果，再进入下一轮。

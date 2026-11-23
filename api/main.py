@@ -22,7 +22,7 @@ from typing import Any, AsyncIterator, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from core.config import Settings
@@ -48,6 +48,7 @@ from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
 from api.sessions import SessionRepository
 from tooling import FunctionCallingLoop, ToolContext, ToolManager, build_commerce_tools, build_reranker
+from monitor.tool_monitor import ToolMonitor, prometheus_metrics
 
 load_dotenv()
 
@@ -623,6 +624,7 @@ def create_app(
                                             "tool_calls": data["calls"], "tool_rounds": data["rounds"],
                                             "tool_repairs": data["repairs"],
                                             "protocol_fallback": data["protocol_fallback"],
+                                            "tool_loop_latency_ms": data["latency_ms"],
                                         })
                                         if data["error_code"]:
                                             tool_summary["error_code"] = data["error_code"]
@@ -748,6 +750,29 @@ def create_app(
                     yield _sse("error", {"error_code": "internal_error", "detail": "服务内部错误，请稍后重试"})
 
         return StreamingResponse(events(), media_type="text/event-stream", headers=_sse_headers())
+
+    if settings.tools.debug:
+        def tools_snapshot() -> dict[str, Any]:
+            tools = app.state.tool_manager
+            if tools is not None:
+                return {"enabled": settings.tools.enabled, **tools.get_health()}
+            return {
+                "enabled": settings.tools.enabled,
+                "status": "unavailable" if settings.tools.enabled else "disabled",
+                "cache_size": 0, "tools": {}, "function_calling": ToolMonitor().loop_snapshot(),
+            }
+
+        @app.get("/tools/stats", tags=["调试"])
+        async def tools_stats():
+            """进程级聚合，不返回参数、数据、消息或用户/会话信息。"""
+            return tools_snapshot()
+
+        @app.get("/metrics", tags=["调试"])
+        async def tool_metrics():
+            return Response(
+                prometheus_metrics(tools_snapshot()),
+                headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+            )
 
     # 关闭时不注册路由，避免只在处理函数里判断而暴露接口存在。
     if settings.memory.debug:

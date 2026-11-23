@@ -384,10 +384,12 @@ async def test_execute_propagates_cancellation_without_marking_failure():
 
 
 def test_get_stats_uses_injected_clock():
-    # 第 3 个值供 T4 写缓存时计算 expires_at 使用。
-    ticks = iter([10.0, 10.25, 10.25])
-    manager = ToolManager(clock=lambda: next(ticks))
-    manager.register(make_spec())
+    now = [10.0]
+    def handler(params, context):
+        now[0] += 0.25
+        return {"ok": True}
+    manager = ToolManager(clock=lambda: now[0])
+    manager.register(make_spec(handler=handler))
 
     asyncio.run(manager.execute("lookup_order", {}, make_context()))
     stats = manager.get_stats()["lookup_order"]
