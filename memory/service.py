@@ -17,6 +17,8 @@ from memory.compactor import MemoryCompactor
 from memory.context import ContextBuilder, MemoryContext
 from memory.maintainer import MemoryMaintainer
 from memory.models import Turn
+from memory.longterm import LongTermMemory
+from memory.profile import ProfileUpdater
 from memory.store import RedisMemoryStore
 from core.intent import IntentResult
 
@@ -79,38 +81,42 @@ class ConversationMemory:
         settings: MemorySettings | None = None,
         compactor: MemoryCompactor | None = None,
         maintainer: MemoryMaintainer | None = None,
+        longterm: LongTermMemory | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.compactor = compactor
         self.maintainer = maintainer
-        self._context = ContextBuilder(store)
+        self.longterm = longterm
+        self._context = ContextBuilder(store, longterm)
         self._closed = False
 
     @classmethod
     async def start(cls, settings: MemorySettings, llm: Any) -> ConversationMemory:
-        """连接 Redis 并启动后台维护；失败由调用方决定是否降级。"""
+        """连接 Redis/Chroma 并启动短期与长期记忆后台维护。"""
         store = RedisMemoryStore.from_url(settings.redis_url, ttl_s=settings.ttl_s)
+        compactor = None
         try:
             await asyncio.wait_for(store.ping(), _STARTUP_TIMEOUT_S)
-        except Exception:
-            await store.close()
-            raise
-
-        compactor = MemoryCompactor(store, llm.summarize)
-        maintainer = MemoryMaintainer.from_env(compactor, store=store)
-        try:
+            profile_updater = ProfileUpdater.from_env(store, llm.extract_profile)
+            longterm = LongTermMemory.from_env(profile_updater=profile_updater)
+            compactor = MemoryCompactor(store, llm.summarize, longterm=longterm)
+            maintainer = MemoryMaintainer.from_env(compactor, store=store, longterm=longterm)
             maintainer.start()
         except Exception:
-            await compactor.close()
+            if compactor is not None:
+                await compactor.close()
             await store.close()
             raise
         logger.info(
-            "记忆服务已启动: ttl_s=%d maintainer_workers=%d",
+            "记忆服务已启动: ttl_s=%d maintainer_workers=%d longterm=true",
             settings.ttl_s,
             maintainer.workers,
         )
-        return cls(store, settings=settings, compactor=compactor, maintainer=maintainer)
+        return cls(
+            store, settings=settings, compactor=compactor,
+            maintainer=maintainer, longterm=longterm,
+        )
 
     def conversation(self, user_id: str, session_id: str):
         """整轮会话锁；持有期间调用 `commit(..., lock_held=True)`。"""
@@ -136,8 +142,10 @@ class ConversationMemory:
                 return found
         return requested_session_id or uuid4().hex[:16], None
 
-    async def read_context(self, user_id: str, session_id: str) -> MemoryContext:
-        return await self._context.get_context(user_id, session_id)
+    async def read_context(
+        self, user_id: str, session_id: str, query: str = "",
+    ) -> MemoryContext:
+        return await self._context.get_context(user_id, session_id, query)
 
     async def persist_intent(
         self, user_id: str, session_id: str, result: IntentResult,
