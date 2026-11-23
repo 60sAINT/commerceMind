@@ -1,4 +1,5 @@
 """CommerceMind tooling package."""
+from tooling.commerce_tools import build_commerce_tools
 from tooling.errors import ToolError, ToolErrorCode, ToolValidationError
 from tooling.reranker import LLMReranker, Reranker, build_reranker
 from tooling.tool_manager import (
@@ -30,5 +31,6 @@ __all__ = [
     "ToolStats",
     "ToolValidationError",
     "build_reranker",
+    "build_commerce_tools",
     "validate_params",
 ]

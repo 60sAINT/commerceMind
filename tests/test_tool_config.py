@@ -32,7 +32,6 @@ def test_tool_settings_defaults_are_safe_and_disabled():
     assert settings.stream_events is False
     assert settings.debug is False
     assert settings.protocol_fallback is True
-    assert settings.demo_orders_path == "data/demo_orders.json"
 
 
 def test_tool_settings_from_env_reads_all_switches(monkeypatch):
@@ -57,7 +56,6 @@ def test_tool_settings_from_env_reads_all_switches(monkeypatch):
         "STREAM_EVENTS": "true",
         "DEBUG": "true",
         "PROTOCOL_FALLBACK": "false",
-        "DEMO_ORDERS": "/tmp/orders.json",
     }
     for key, value in values.items():
         monkeypatch.setenv("COMMERCEMIND_TOOLS_" + key, value)
@@ -85,7 +83,6 @@ def test_tool_settings_from_env_reads_all_switches(monkeypatch):
     assert settings.stream_events is True
     assert settings.debug is True
     assert settings.protocol_fallback is False
-    assert settings.demo_orders_path == "/tmp/orders.json"
 
 
 def test_tool_settings_invalid_env_values_fall_back(monkeypatch):
@@ -94,7 +91,6 @@ def test_tool_settings_invalid_env_values_fall_back(monkeypatch):
     monkeypatch.setenv("COMMERCEMIND_TOOLS_MAX_RETRIES", "-1")
     monkeypatch.setenv("COMMERCEMIND_TOOLS_CACHE_TTL_S", "-2")
     monkeypatch.setenv("COMMERCEMIND_TOOLS_TIMEOUT_S", "0")
-    monkeypatch.setenv("COMMERCEMIND_TOOLS_DEMO_ORDERS", "  ")
 
     settings = ToolSettings.from_env()
 
@@ -103,7 +99,6 @@ def test_tool_settings_invalid_env_values_fall_back(monkeypatch):
     assert settings.max_retries == 1
     assert settings.cache_ttl_s == 30.0
     assert settings.timeout_s == 3.0
-    assert settings.demo_orders_path == "data/demo_orders.json"
 
 
 @pytest.mark.parametrize(
@@ -128,7 +123,6 @@ def test_tool_settings_invalid_env_values_fall_back(monkeypatch):
         {"max_result_chars": 20001},
         {"max_schema_hint_chars": 100},
         {"max_schema_hint_chars": 4001},
-        {"demo_orders_path": "  "},
     ],
 )
 def test_tool_settings_validate_invalid_values(kwargs):

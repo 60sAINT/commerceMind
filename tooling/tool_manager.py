@@ -66,6 +66,10 @@ class ToolContext:
     request_id: str
     intent: str | None = None
     entities: Mapping[str, Any] = field(default_factory=dict)
+    intent_group: str | None = None
+    urgency: str | None = None
+    intent_confidence: float = 0.0
+    context_available: bool = False
 
     def __post_init__(self) -> None:
         for name in ("user_id", "session_id", "request_id"):
@@ -82,6 +86,18 @@ class ToolContext:
         if not isinstance(self.entities, Mapping):
             raise TypeError("entities 必须是映射")
         object.__setattr__(self, "entities", copy.deepcopy(dict(self.entities)))
+        for name in ("intent_group", "urgency"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} 必须是非空字符串或 None")
+        if (
+            isinstance(self.intent_confidence, bool)
+            or not isinstance(self.intent_confidence, (int, float))
+            or not 0 <= self.intent_confidence <= 1
+        ):
+            raise ValueError("intent_confidence 必须在 0 到 1 之间")
+        if not isinstance(self.context_available, bool):
+            raise TypeError("context_available 必须是布尔值")
 
 
 @dataclass(frozen=True, slots=True)

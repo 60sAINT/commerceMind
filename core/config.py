@@ -200,12 +200,10 @@ class ToolSettings:
     stream_events: bool = False
     debug: bool = False
     protocol_fallback: bool = True
-    demo_orders_path: str = "data/demo_orders.json"
 
     def __post_init__(self) -> None:
         trigger = str(self.trigger).strip().lower()
         object.__setattr__(self, "trigger", trigger)
-        object.__setattr__(self, "demo_orders_path", str(self.demo_orders_path or "").strip())
         if trigger not in {"auto", "always", "off"}:
             raise ValueError("COMMERCEMIND_TOOLS_TRIGGER 仅支持 auto、always、off")
 
@@ -243,8 +241,6 @@ class ToolSettings:
             raise ValueError("max_result_chars 必须在 256 到 20000 之间")
         if not 128 <= self.max_schema_hint_chars <= 4000:
             raise ValueError("max_schema_hint_chars 必须在 128 到 4000 之间")
-        if not self.demo_orders_path:
-            raise ValueError("demo_orders_path 不能为空")
 
     @classmethod
     def from_env(cls) -> "ToolSettings":
@@ -272,7 +268,6 @@ class ToolSettings:
             stream_events=_env_bool("COMMERCEMIND_TOOLS_STREAM_EVENTS", False),
             debug=_env_bool("COMMERCEMIND_TOOLS_DEBUG", False),
             protocol_fallback=_env_bool("COMMERCEMIND_TOOLS_PROTOCOL_FALLBACK", True),
-            demo_orders_path=os.getenv("COMMERCEMIND_TOOLS_DEMO_ORDERS", "").strip() or "data/demo_orders.json",
         )
 
 
