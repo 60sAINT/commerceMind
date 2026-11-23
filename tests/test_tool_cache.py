@@ -385,6 +385,26 @@ async def test_cache_ttl_zero_bypasses_cache():
 
 
 @pytest.mark.asyncio
+async def test_side_effecting_tool_ignores_positive_cache_ttl():
+    calls = 0
+
+    async def handler(params, context):
+        nonlocal calls
+        calls += 1
+        return calls
+
+    manager = ToolManager()
+    manager.register(make_spec(handler, retry_safe=False))
+    first = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
+    second = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
+
+    assert first.data == 1
+    assert second.data == 2
+    assert second.cached is False
+    assert manager.cache_size == 0
+
+
+@pytest.mark.asyncio
 async def test_use_cache_false_neither_reads_nor_writes():
     calls = 0
 
@@ -501,7 +521,7 @@ async def test_open_breaker_still_serves_valid_cache():
 
 
 @pytest.mark.asyncio
-async def test_cache_is_checked_before_breaker_like_echomind():
+async def test_cache_does_not_block_execution_when_recovery_is_due():
     clock = Clock()
     calls = 0
 
@@ -515,19 +535,27 @@ async def test_cache_is_checked_before_breaker_like_echomind():
     await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
 
     registered = manager._tools["lookup_order"]
-    registered.breaker.state = CircuitState.OPEN
-    registered.breaker.opened_at = clock.now
+    breaker = registered.breaker
+    for _ in range(breaker.threshold):
+        breaker.record_failure()
 
     clock.now += 59
     hit = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
     assert hit.cached is True
     assert calls == 1
 
-    # EchoMind 的顺序是“先缓存、后熔断”，所以恢复时间到了也先返回缓存。
-    clock.now += 2
-    still_cached = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
-    assert still_cached.cached is True
-    assert calls == 1
+    # 正好到达恢复时间，仍有效的缓存也让出执行机会。
+    clock.now += 1
+    refreshed = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
+    assert refreshed.cached is False
+    assert refreshed.data["call"] == 2
+    assert refreshed.attempts == 1
+    assert stats_of(manager)["cache_hits"] == 1
+    # T4 只决定是否读缓存。T5 的 allow() 仍能取得唯一的半开探测名额。
+    assert breaker.state is CircuitState.OPEN
+    assert breaker.allow() is True
+    assert breaker.state is CircuitState.HALF_OPEN
+    assert breaker.allow() is False
 
 
 @pytest.mark.asyncio

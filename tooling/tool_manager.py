@@ -104,7 +104,7 @@ class ToolSpec:
     timeout_s: float = 3.0
     max_retries: int = 1
     retry_backoff_s: float = 0.1
-    cache_ttl_s: float = 0.0  # 0 = 不缓存（与 EchoMind 一致，工具显式开启）
+    cache_ttl_s: float = 0.0  # 只读工具显式开启，0 = 不缓存
     cache_scope: tuple[str, ...] = ("user_id",)
     retry_safe: bool = True  # 只读工具 True；副作用工具 False
     supports_rerank: bool = False
@@ -347,13 +347,22 @@ class CircuitBreaker:
         self.opened_at: float | None = None
         self._probe_in_flight = False
 
+    @property
+    def recovery_due(self) -> bool:
+        """熔断是否已到恢复时间，不改变状态，也不占用探测名额。"""
+        return (
+            self.state is CircuitState.OPEN
+            and self.opened_at is not None
+            and self._clock() - self.opened_at >= self.recovery_s
+        )
+
     def allow(self) -> bool:
         """是否允许本次调用；HALF_OPEN 时只放一个探测。"""
         if self.state is CircuitState.CLOSED:
             return True
 
         if self.state is CircuitState.OPEN:
-            if self.opened_at is None or self._clock() - self.opened_at < self.recovery_s:
+            if not self.recovery_due:
                 return False
             self.state = CircuitState.HALF_OPEN
             self.generation += 1
@@ -436,7 +445,7 @@ class ToolManager:
         if tool.name in self._tools:
             raise ValueError(f"工具已注册: {tool.name}")
         self.invalidate_cache(tool.name)
-        self._tools[tool.name] = RegisteredTool(spec=tool)
+        self._tools[tool.name] = RegisteredTool(spec=tool, breaker=CircuitBreaker(clock=self._clock))
         logger.info("注册工具: %s", tool.name)
 
     def unregister(self, name: str) -> bool:
@@ -580,7 +589,7 @@ class ToolManager:
 
     def _cache_store(self, key: str, data: Any, ttl: float, reranked: bool = False) -> None:
         """写缓存：达到上限时按插入顺序删掉最旧的 1/4。"""
-        if len(self._cache) >= self._cache_max_entries:
+        if key not in self._cache and len(self._cache) >= self._cache_max_entries:
             drop = max(1, self._cache_max_entries // 4)
             for old_key in list(self._cache)[:drop]:
                 del self._cache[old_key]
@@ -602,7 +611,8 @@ class ToolManager:
 
         `deadline` 是 `time.monotonic()` 绝对时间，由 FunctionCallingLoop 传入。
         每次尝试取 `min(tool.timeout_s, deadline - now)`；只有 `retry_safe=True`
-        的工具会按指数退避重试。缓存顺序为：校验 → 缓存 → （T5 熔断）→ 执行。
+        的工具会按指数退避重试和使用缓存。熔断到恢复时间时跳过缓存读取，
+        让请求进入执行路径（T5 接入半开探测）。
         `rerank_top_k` 由 T6 接入，目前只参与缓存 key。
         """
         if not isinstance(context, ToolContext):
@@ -636,14 +646,15 @@ class ToolManager:
 
         spec = registered.spec
         stats = registered.stats
+        cache_key = None
         cache_version = self._cache_versions.get(name, 0)
-        cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and spec.supports_rerank else 0
+        if use_cache and spec.retry_safe and spec.cache_ttl_s > 0:
+            cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and spec.supports_rerank else 0
+            cache_key = self._cache_key(spec, arguments, context, cache_rerank_top_k)
 
-        # 与 EchoMind 一致：缓存命中算一次成功调用，但不产生物理尝试。
-        if use_cache and spec.cache_ttl_s > 0:
-            cached = self._cache_lookup(
-                self._cache_key(spec, arguments, context, cache_rerank_top_k)
-            )
+        # 缓存命中算一次成功调用。到达恢复时间时，给实际调用留出探测机会。
+        if cache_key is not None and not registered.breaker.recovery_due:
+            cached = self._cache_lookup(cache_key)
             if cached is not None:
                 cached_data, cached_reranked = cached
                 stats.total += 1
@@ -719,15 +730,10 @@ class ToolManager:
                 )
                 # 与 EchoMind 一致：缓存最终结果；版本变化则不回填。
                 if (
-                    use_cache
-                    and spec.cache_ttl_s > 0
+                    cache_key is not None
                     and cache_version == self._cache_versions.get(name, 0)
                 ):
-                    self._cache_store(
-                        self._cache_key(spec, arguments, context, cache_rerank_top_k),
-                        data,
-                        spec.cache_ttl_s,
-                    )
+                    self._cache_store(cache_key, data, spec.cache_ttl_s)
                 return result
 
             if not last_retryable or not spec.retry_safe or attempts >= max_attempts:
