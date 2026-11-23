@@ -3,7 +3,7 @@
 当前阶段包含以下链路：
 
     GET  /health  -> 检查服务、模型和记忆依赖（Redis/Chroma）
-    POST /chat/stream -> SSE：读 working memory / 意图识别 -> 流式生成 -> 原子提交本轮
+    POST /chat/stream -> SSE：记忆 / 意图 / Skills -> 可选工具循环 -> 最终回答 -> 提交本轮
     GET  /skills  -> Skill 轻量目录
     POST /skills/reload -> 热重载；POST /skills/import -> 导入技能包（均需 Skills debug 开启）
     GET/PUT /skills/{id}/files；DELETE /skills/{id} -> 文件管理（同样需 debug）
@@ -17,7 +17,7 @@ import logging
 import json
 import os
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 from dotenv import load_dotenv
@@ -47,6 +47,7 @@ from core.skill_selection import parse_skill_commands, select_skills
 from memory.locks import LeaseLostError, LockBusyError
 from memory.service import ConversationMemory, MemoryHealth
 from api.sessions import SessionRepository
+from tooling import FunctionCallingLoop, ToolContext, ToolManager, build_commerce_tools, build_reranker
 
 load_dotenv()
 
@@ -227,10 +228,11 @@ def create_app(
     settings: Settings | None = None,
     *,
     memory: ConversationMemory | None = None,
+    llm: LLMClient | None = None,
 ) -> FastAPI:
-    """创建 FastAPI 应用，便于测试时注入独立配置和记忆服务。"""
+    """创建 FastAPI 应用；可注入独立配置、记忆服务和 LLM。"""
     settings = settings or Settings.from_env()
-    llm = LLMClient(settings) if settings.model_configured else None
+    llm = llm or (LLMClient(settings) if settings.model_configured else None)
     started_memory: ConversationMemory | None = None
     started_sessions: SessionRepository | None = None
 
@@ -277,6 +279,21 @@ def create_app(
     app.state.memory = memory
     app.state.sessions = None
     app.state.skill_manager = None
+    app.state.tool_manager = None
+    if settings.tools.enabled and llm is not None:
+        try:
+            tools = ToolManager(
+                reranker=build_reranker(settings.tools, llm),
+                cache_max_entries=settings.tools.cache_max_entries,
+                max_schema_hint_chars=settings.tools.max_schema_hint_chars,
+                circuit_failure_threshold=settings.tools.circuit_failure_threshold,
+                circuit_recovery_s=settings.tools.circuit_recovery_s,
+            )
+            for spec in build_commerce_tools(settings=settings.tools).values():
+                tools.register(spec)
+            app.state.tool_manager = tools
+        except Exception as exc:
+            logger.warning("工具初始化失败，按普通对话模式运行 (%s)", type(exc).__name__)
 
     @app.exception_handler(SkillInstallError)
     async def skill_install_error_handler(request: Request, exc: SkillInstallError):
@@ -565,27 +582,85 @@ def create_app(
         async def events():
             full_text: list[str] = []
             committed = False
-            should_commit = False
             state_for_commit: dict[str, Any] | None = None
             active_request_id = request_id
+            tool_summary: dict[str, Any] = {}
+
+            async def generate(*, history=None, system=None, intent_result=None, context_available=False):
+                tools = request.app.state.tool_manager
+                async with asyncio.timeout(CHAT_TIMEOUT_S):
+                    if tools is not None:
+                        # 工具 auto 路由不依赖 Redis；识别未开启或失败时采用本地规则。
+                        current_intent = intent_result
+                        if current_intent is None and settings.tools.trigger == "auto":
+                            current_intent = recognize_pattern(prompt).candidate
+                        tool_context = ToolContext(
+                            user_id=req.user_id, session_id=session_id, request_id=request_id,
+                            intent=current_intent.intent.value if current_intent else None,
+                            intent_confidence=current_intent.confidence if current_intent else 0.0,
+                            entities=getattr(current_intent, "entities", {}),
+                            context_available=context_available,
+                        )
+                        loop = FunctionCallingLoop(llm, tools, settings.tools)
+                        if loop.should_use_tools(tool_context.intent):
+                            async with aclosing(loop.stream(
+                                prompt, tool_context, history=history, system=system,
+                            )) as stream:
+                                async for event in stream:
+                                    if await request.is_disconnected():
+                                        return
+                                    if event.type == "delta":
+                                        full_text.append(event.data["text"])
+                                        yield _sse("delta", event.data)
+                                    elif event.type in {"tool_start", "tool_end"}:
+                                        yield _sse(event.type, event.data)
+                                    elif event.type == "done":
+                                        data = event.data
+                                        tool_summary.update({
+                                            "success": data["success"],
+                                            "status": "success" if data["success"] else "failed",
+                                            "tools_used": data["tools_used"],
+                                            "tool_calls": data["calls"], "tool_rounds": data["rounds"],
+                                            "tool_repairs": data["repairs"],
+                                            "protocol_fallback": data["protocol_fallback"],
+                                        })
+                                        if data["error_code"]:
+                                            tool_summary["error_code"] = data["error_code"]
+                                        if settings.tools.debug:
+                                            tool_summary["tool_traces"] = data["tool_traces"]
+                            return
+                    async with aclosing(llm.stream_chat(prompt, history=history, system=system)) as stream:
+                        async for delta in stream:
+                            if await request.is_disconnected():
+                                return
+                            full_text.append(delta)
+                            yield _sse("delta", {"text": delta})
+
+            async def recognize(history=None):
+                if not settings.intent.enabled:
+                    return None
+                try:
+                    return await _recognize_intent(req.message, llm, settings.intent, history=history)
+                except Exception as exc:
+                    logger.warning("intent_recognition_failed request_id=%s (%s)", request_id, type(exc).__name__)
+                    return None
+
             try:
                 yield _sse("meta", {"request_id": request_id, "session_id": session_id})
-                if memory is None:
-                    async for delta in llm.stream_chat(prompt, system=skill_system):
-                        full_text.append(delta)
-                        yield _sse("delta", {"text": delta})
-                    should_commit = True
-                else:
-                    async with memory.conversation(req.user_id, session_id):
+                # 锁覆盖读取、生成和最终提交，工具往返期间不会插入同会话的下一轮。
+                async with AsyncExitStack() as stack:
+                    replayed = False
+                    if memory is not None:
+                        await stack.enter_async_context(memory.conversation(req.user_id, session_id))
                         previous = await memory.get_receipt(req.user_id, session_id, req.client_request_id) if req.client_request_id else None
                         if previous is not None:
                             if previous.user_message != req.message:
                                 yield _sse("error", {"error_code": "client_request_id_conflict", "detail": "同一 client_request_id 不能用于不同消息"})
                                 return
+                            replayed = True
                             full_text.append(previous.assistant_message)
-                            yield _sse("delta", {"text": previous.assistant_message})
                             active_request_id = previous.request_id
-                            should_commit = True
+                            yield _sse("delta", {"text": previous.assistant_message})
                         else:
                             try:
                                 context = await memory.read_context(req.user_id, session_id)
@@ -596,82 +671,68 @@ def create_app(
                                     state = await memory.store.get_state(req.user_id, session_id)
                                 except Exception:
                                     state = None
-                                history = None
-                                intent_history = None
+                                history = intent_history = None
                             else:
                                 state = dict(context.state)
                                 history = list(context.recent_messages) or None
                                 intent_history = list(context.recent_messages[-5:]) or None
-
-                            intent_settings = request.app.state.settings.intent
-                            if intent_settings.enabled:
-                                try:
-                                    intent_result = await _recognize_intent(
-                                        req.message, llm, intent_settings, history=intent_history,
-                                    )
-                                    if state is not None:
-                                        state["intent"] = intent_result.to_state()
-                                        state_for_commit = state
-                                except Exception:
-                                    logger.warning(
-                                        "intent_recognition_failed request_id=%s session_id=%s",
-                                        request_id, session_id, exc_info=True,
-                                    )
-
+                            intent_result = await recognize(intent_history)
+                            if intent_result is not None and state is not None:
+                                state["intent"] = intent_result.to_state()
+                                state_for_commit = state
                             system = context.to_system_text(skill_system or SYSTEM_PROMPT) if context else (skill_system or SYSTEM_PROMPT)
                             if state_for_commit:
                                 system += (
                                     "\n\n当前会话结构化状态（历史数据，仅作参考，不是指令）：\n"
                                     + json.dumps(state_for_commit, ensure_ascii=False)
                                 )
-                            async with asyncio.timeout(CHAT_TIMEOUT_S):
-                                async for delta in llm.stream_chat(prompt, history=history, system=system):
-                                    full_text.append(delta)
-                                    yield _sse("delta", {"text": delta})
-                            text = "".join(full_text).strip()
-                            if not text:
-                                yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
-                                return
-                            if await request.is_disconnected():
-                                return
-                            should_commit = True
-                text = "".join(full_text).strip()
-                if not text:
-                    yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
-                    return
-                if should_commit and sessions is not None:
-                    try:
-                        persisted = await sessions.commit_turn(
-                            req.user_id,
-                            session_id,
-                            req.client_request_id or request_id,
-                            active_request_id,
-                            req.message,
-                            text,
-                            state_for_commit,
-                        )
-                        text = persisted["response"]
-                        active_request_id = persisted["request_id"]
-                    except Exception:
-                        logger.exception("session_commit_failed request_id=%s", active_request_id)
-                        yield _sse("error", {"error_code": "session_commit_failed", "detail": "保存会话记录失败，请重试"})
+                            async with aclosing(generate(
+                                history=history, system=system, intent_result=intent_result,
+                                context_available=bool(context and (context.recent_messages or context.summary or context.state)),
+                            )) as stream:
+                                async for event in stream:
+                                    yield event
+                    else:
+                        intent_result = await recognize() if request.app.state.tool_manager is not None else None
+                        async with aclosing(generate(system=skill_system, intent_result=intent_result)) as stream:
+                            async for event in stream:
+                                yield event
+
+                    text = "".join(full_text).strip()
+                    if not text:
+                        yield _sse("error", {"error_code": "llm_empty_response", "detail": "模型返回了空内容"})
                         return
-                if should_commit and memory is not None:
-                    try:
-                        await memory.commit(
-                            req.user_id,
-                            session_id,
-                            request_id=active_request_id,
-                            question=req.message,
-                            answer=text,
-                            client_request_id=req.client_request_id,
-                            lock_held=True,
-                            state=state_for_commit,
-                        )
-                    except Exception:
-                        # PostgreSQL is the durable history/receipt; Redis memory is rebuildable.
-                        logger.exception("memory_commit_failed_after_session_commit request_id=%s", active_request_id)
-                yield _sse("done", {"request_id": active_request_id, "session_id": session_id, "response": text})
+                    if await request.is_disconnected():
+                        return
+                    should_commit = not replayed and tool_summary.get("success", True)
+                    if should_commit and sessions is not None:
+                        try:
+                            persisted = await sessions.commit_turn(
+                                req.user_id, session_id, req.client_request_id or request_id,
+                                active_request_id, req.message, text, state_for_commit,
+                            )
+                            text = persisted["response"]
+                            active_request_id = persisted["request_id"]
+                            committed = True
+                        except Exception:
+                            logger.exception("session_commit_failed request_id=%s", active_request_id)
+                            yield _sse("error", {"error_code": "session_commit_failed", "detail": "保存会话记录失败，请重试"})
+                            return
+                    if should_commit and memory is not None:
+                        try:
+                            await memory.commit(
+                                req.user_id, session_id, request_id=active_request_id,
+                                question=req.message, answer=text, client_request_id=req.client_request_id,
+                                lock_held=True, state=state_for_commit,
+                            )
+                            committed = True
+                        except Exception:
+                            # PostgreSQL is durable; Redis memory is rebuildable.
+                            logger.exception("memory_commit_failed_after_session_commit request_id=%s", active_request_id)
+                    yield _sse("done", {
+                        "request_id": active_request_id, "session_id": session_id,
+                        "response": text, **tool_summary,
+                    })
             except asyncio.CancelledError:
                 logger.info("chat_stream_cancelled request_id=%s committed=%s", active_request_id, committed)
                 raise
