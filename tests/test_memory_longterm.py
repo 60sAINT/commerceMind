@@ -23,6 +23,8 @@ class FakeCollection:
     def __init__(self):
         self.rows = {}
         self.response = None
+        self.responses = []
+        self.query_calls = []
         self.fail = False
     def upsert(self, ids, documents, metadatas, embeddings):
         if self.fail:
@@ -31,8 +33,11 @@ class FakeCollection:
             self.rows[eid] = (doc, meta, vector)
     def query(self, **kwargs):
         self.query_args = kwargs
+        self.query_calls.append(kwargs)
         if self.fail:
             raise RuntimeError("offline")
+        if self.responses:
+            return self.responses.pop(0)
         if self.response is not None:
             return self.response
         return {"ids": [list(self.rows)], "documents": [[r[0] for r in self.rows.values()]],
@@ -110,6 +115,35 @@ async def test_score_boundary_topk_and_search_failure():
     c.fail = True
     assert await m.search("u", "now", "问题") == []
     assert await m.search("u", "now", " ") == []
+
+
+@pytest.mark.asyncio
+async def test_context_search_prioritizes_current_session_and_fills_from_other_sessions():
+    c = FakeCollection()
+    user = memory_identity("u")
+    current = memory_identity("now")
+    old = memory_identity("old")
+    c.responses = [
+        {"ids": [["current"]], "documents": [["本会话的退货进度"]],
+         "metadatas": [[{"user_key": user, "session_key": current}]], "distances": [[.1]]},
+        {"ids": [["current", "old-a", "old-b"]],
+         "documents": [["本会话的退货进度", "上次的订单信息", "更早的处理结论"]],
+         "metadatas": [[{"user_key": user, "session_key": current},
+                        {"user_key": user, "session_key": old},
+                        {"user_key": user, "session_key": old}]],
+         "distances": [[.1, .2, .3]]},
+    ]
+    m = memory(c, top_k=3)
+
+    result = await m.search_for_context("u", "now", "退款到哪一步了")
+
+    assert [match.episode_id for match in result] == ["current", "old-a", "old-b"]
+    assert c.query_calls[0]["where"] == {
+        "$and": [{"user_key": {"$eq": user}}, {"session_key": {"$eq": current}}],
+    }
+    assert c.query_calls[1]["where"] == {
+        "$and": [{"user_key": {"$eq": user}}, {"session_key": {"$ne": current}}],
+    }
 
 
 @pytest.mark.parametrize("kwargs", [{"top_k": 0}, {"max_tokens": True}, {"min_score": float("nan")}, {"min_turns": -1}])

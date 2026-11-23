@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from core.config import IntentSettings, MemorySettings, Settings
 from core.intent import IntentCategory, IntentResult, IntentSource
 from core.llm import ChatResult, LLMError
 from memory.locks import LockBusyError
+from memory.profile import UserProfile
 from memory.service import ConversationMemory
 from memory.store import RedisMemoryStore
 from sse_helpers import chat_stream
@@ -315,13 +317,43 @@ async def test_summary_is_injected_into_system_not_messages(memory_env):
 
 
 @pytest.mark.asyncio
+async def test_chat_reads_longterm_context_using_current_question(memory_env):
+    _, service = memory_env
+    queries = []
+    profile = UserProfile(preferences=["偏好宽松版型"])
+
+    async def get_profile(user_id):
+        assert user_id == "u1"
+        return profile
+
+    class LongTerm:
+        profile_updater = SimpleNamespace(get_profile=get_profile)
+
+        async def search_for_context(self, user_id, session_id, query):
+            queries.append((user_id, session_id, query))
+            return [SimpleNamespace(text="上次退款申请仍在核对订单信息。")]
+
+    service._context._longterm = LongTerm()
+    app = create_app(make_settings(), memory=service)
+    llm = FakeLLM()
+    app.state.llm = llm
+
+    response = await chat_stream(app, chat_body("上次退款处理到哪一步了？"))
+
+    assert response.status_code == 200
+    assert queries == [("u1", "c1", "上次退款处理到哪一步了？")]
+    assert "上次退款申请仍在核对订单信息。" in llm.calls[0]["system"]
+    assert "偏好宽松版型" in llm.calls[0]["system"]
+
+
+@pytest.mark.asyncio
 async def test_read_failure_degrades_to_no_history(memory_env):
     _, service = memory_env
     app = create_app(make_settings(), memory=service)
     llm = FakeLLM()
     app.state.llm = llm
 
-    async def broken(user_id: str, session_id: str):
+    async def broken(user_id: str, session_id: str, query: str = ""):
         raise ConnectionError("redis down")
 
     service.read_context = broken

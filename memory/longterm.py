@@ -82,14 +82,53 @@ class LongTermMemory:
         return True
 
     async def search(self, user_id: str, session_id: str, query: str) -> list[EpisodeMatch]:
+        """只检索当前用户的其他会话，保留原有显式跨会话搜索语义。"""
+        return await self._search_scope(user_id, session_id, query, scope="other")
+
+    async def search_for_context(
+        self, user_id: str, session_id: str, query: str,
+    ) -> list[EpisodeMatch]:
+        """当前会话优先；不足 top-k 时再用该用户其他历史补充。"""
+        current = await self._search_scope(user_id, session_id, query, scope="current")
+        if len(current) >= self.top_k:
+            return current
+        used_ids = {match.episode_id for match in current}
+        used_text = {match.text for match in current}
+        prefix = "\n\n".join(match.text for match in current)
+        historical = await self._search_scope(
+            user_id, session_id, query, scope="other", max_tokens=self.max_tokens,
+            prefix=prefix + ("\n\n" if prefix else ""),
+        )
+        result = list(current)
+        for match in historical:
+            if match.episode_id in used_ids or match.text in used_text:
+                continue
+            result.append(match)
+            used_ids.add(match.episode_id)
+            used_text.add(match.text)
+            if len(result) >= self.top_k:
+                break
+        return result
+
+    async def _search_scope(
+        self, user_id: str, session_id: str, query: str, *, scope: str,
+        max_tokens: int | None = None, prefix: str = "",
+    ) -> list[EpisodeMatch]:
         if not query.strip():
             return []
         try:
             user, session = memory_identity(user_id), memory_identity(session_id)
+            if scope == "current":
+                where = {"$and": [{"user_key": {"$eq": user}}, {"session_key": {"$eq": session}}]}
+            elif scope == "other":
+                where = {"$and": [{"user_key": {"$eq": user}}, {"session_key": {"$ne": session}}]}
+            else:
+                raise ValueError("无效的情景记忆范围")
+            budget = self.max_tokens if max_tokens is None else max_tokens
             def read():
                 return self.collection.query(query_embeddings=self._vectors([redact(query)]),
                     n_results=max(self.top_k * 4, 12),
-                    where={"$and": [{"user_key": {"$eq": user}}, {"session_key": {"$ne": session}}]},
+                    where=where,
                     include=["documents", "metadatas", "distances"])
             raw = await asyncio.to_thread(read)
             hits, seen, seen_texts, texts = [], set(), set(), []
@@ -97,7 +136,10 @@ class LongTermMemory:
                     raw["ids"][0], raw["documents"][0], raw["metadatas"][0], raw["distances"][0]),
                     key=lambda item: item[3]):
                 # 防御性二次过滤，不能仅信任向量库或测试替身返回的过滤结果。
-                if metadata.get("user_key") != user or metadata.get("session_key") == session:
+                metadata_session = metadata.get("session_key")
+                if (metadata.get("user_key") != user
+                        or (scope == "current" and metadata_session != session)
+                        or (scope == "other" and metadata_session == session)):
                     continue
                 if not math.isfinite(distance):
                     continue
@@ -105,8 +147,10 @@ class LongTermMemory:
                 text = redact(document).strip()
                 if score < self.min_score or not text or eid in seen or text in seen_texts:
                     continue
-                fitted = self.counter.truncate_text(text, self.max_tokens,
-                                                   prefix="\n\n".join(texts) + ("\n\n" if texts else ""))
+                fitted = self.counter.truncate_text(
+                    text, budget, prefix=prefix + "\n\n".join(texts)
+                    + ("\n\n" if prefix or texts else ""),
+                )
                 if not fitted:
                     continue
                 texts.append(fitted)
