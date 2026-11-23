@@ -551,11 +551,10 @@ async def test_cache_does_not_block_execution_when_recovery_is_due():
     assert refreshed.data["call"] == 2
     assert refreshed.attempts == 1
     assert stats_of(manager)["cache_hits"] == 1
-    # T4 只决定是否读缓存。T5 的 allow() 仍能取得唯一的半开探测名额。
-    assert breaker.state is CircuitState.OPEN
-    assert breaker.allow() is True
-    assert breaker.state is CircuitState.HALF_OPEN
-    assert breaker.allow() is False
+    assert breaker.state is CircuitState.CLOSED
+    hit = await manager.execute("lookup_order", {"order_id": "A1001-001"}, make_context())
+    assert hit.cached is True
+    assert hit.data == refreshed.data
 
 
 @pytest.mark.asyncio

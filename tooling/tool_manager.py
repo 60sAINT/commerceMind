@@ -1,7 +1,7 @@
 """进程内工具管理器：工具契约、注册表与统一执行入口。
 
 T1 落地“契约 + 注册表”，T2 接入 JSON Schema 参数校验，T3 接入超时与重试，
-T4 接入 TTL 缓存：
+T4 接入 TTL 缓存，T5 接入熔断与降级：
 
 - `ToolContext` / `ToolSpec` / `ToolResult` / `ToolStats` / `CircuitState`；
 - `ToolManager.register()` / `unregister()` / `definitions()` / `get_stats()` / `fork()`；
@@ -10,7 +10,7 @@ T4 接入 TTL 缓存：
 - `invalidate_cache()` 通过版本号同时实现主动失效与在途结果不回填。
 
 缓存结构与 EchoMind 保持一致：进程内字典、`工具名 + MD5` 键、`(数据, 过期时间, 是否重排)` 值。
-熔断执行、降级与重排分别在 T5–T6 接入；
+重排在 T6 接入；
 本模块不依赖 FastAPI，也不依赖具体 LLM 或业务工具，可被脚本、测试、评测直接复用。
 """
 from __future__ import annotations
@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 _TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _CACHE_SCOPE_FIELDS = frozenset({"user_id", "session_id", "request_id", "intent"})
+_DEPENDENCY_FAILURE_MESSAGES = {
+    ToolErrorCode.TOOL_TIMEOUT.value: "工具执行超时",
+    ToolErrorCode.TOOL_HANDLER_ERROR.value: "工具执行失败",
+}
 
 
 class CircuitState(str, Enum):
@@ -310,6 +314,8 @@ class ToolStats:
     timeout: int = 0  # 超时（T3）
     cache_hits: int = 0  # 缓存命中（T4）
     retries: int = 0  # 重试次数（T3）
+    circuit_rejections: int = 0
+    degraded: int = 0
     total_latency_ms: float = 0.0
     consecutive_fails: int = 0
 
@@ -325,7 +331,7 @@ class ToolStats:
 class CircuitBreaker:
     """三态熔断器：CLOSED → OPEN → HALF_OPEN → CLOSED。
 
-    T1 提供状态机与 generation 隔离；T5 才把它接进 `ToolManager.execute()`。
+    使用 generation 隔离旧请求的迟到结果。
     使用注入的 `clock()`，测试不需要真的等待恢复时间。
     """
 
@@ -382,6 +388,12 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
         self.opened_at = None
 
+    def abandon_probe(self, generation: int) -> None:
+        """取消或无有效结果的探测可以立即让下一次调用接手。"""
+        if self.state is CircuitState.HALF_OPEN and generation == self.generation:
+            self.state = CircuitState.OPEN
+            self._probe_in_flight = False
+
     def record_failure(self, generation: int | None = None) -> None:
         """记录一次依赖失败；达到阈值或半开探测失败时打开熔断。"""
         if generation is not None and generation != self.generation:
@@ -418,6 +430,8 @@ class ToolManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_schema_hint_chars: int = 800,
         cache_max_entries: int = 5000,
+        circuit_failure_threshold: int = 5,
+        circuit_recovery_s: float = 60.0,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock 必须可调用")
@@ -435,6 +449,10 @@ class ToolManager:
         self._cache_max_entries = cache_max_entries
         self._cache: dict[str, tuple[Any, float, bool]] = {}
         self._cache_versions: dict[str, int] = {}
+        # 复用状态机的参数校验，即使注册表暂时为空也能发现配置错误。
+        breaker = CircuitBreaker(circuit_failure_threshold, circuit_recovery_s, clock)
+        self._circuit_failure_threshold = breaker.threshold
+        self._circuit_recovery_s = breaker.recovery_s
 
     # ── 注册 / 注销 ──────────────────────────────────────────────────────────
 
@@ -445,7 +463,10 @@ class ToolManager:
         if tool.name in self._tools:
             raise ValueError(f"工具已注册: {tool.name}")
         self.invalidate_cache(tool.name)
-        self._tools[tool.name] = RegisteredTool(spec=tool, breaker=CircuitBreaker(clock=self._clock))
+        self._tools[tool.name] = RegisteredTool(
+            spec=tool,
+            breaker=CircuitBreaker(self._circuit_failure_threshold, self._circuit_recovery_s, self._clock),
+        )
         logger.info("注册工具: %s", tool.name)
 
     def unregister(self, name: str) -> bool:
@@ -612,7 +633,7 @@ class ToolManager:
         `deadline` 是 `time.monotonic()` 绝对时间，由 FunctionCallingLoop 传入。
         每次尝试取 `min(tool.timeout_s, deadline - now)`；只有 `retry_safe=True`
         的工具会按指数退避重试和使用缓存。熔断到恢复时间时跳过缓存读取，
-        让请求进入执行路径（T5 接入半开探测）。
+        让一个请求执行半开探测。
         `rerank_top_k` 由 T6 接入，目前只参与缓存 key。
         """
         if not isinstance(context, ToolContext):
@@ -670,10 +691,68 @@ class ToolManager:
                 )
 
         started = self._clock()
+        breaker = registered.breaker
         stats.total += 1
+        failure = None
+        if deadline is not None and deadline <= started:
+            result = ToolResult(
+                tool_name=name, success=False,
+                error_code=ToolErrorCode.TOOL_DEADLINE_EXCEEDED.value, error="工具阶段预算已耗尽",
+            )
+        elif not breaker.allow():
+            stats.circuit_rejections += 1
+            failure = ToolFailure(ToolErrorCode.TOOL_CIRCUIT_OPEN.value, "工具熔断中，请稍后重试")
+            result = ToolResult(tool_name=name, success=False, error_code=failure.code, error=failure.message)
+        else:
+            generation = breaker.generation
+            probe = breaker.state is CircuitState.HALF_OPEN
+            try:
+                result = await self._execute_attempts(registered, arguments, context, deadline, probe=probe)
+            except asyncio.CancelledError:
+                breaker.abandon_probe(generation)
+                raise
 
+            if result.success:
+                breaker.record_success(generation)
+                stats.success += 1
+                if (
+                    generation == breaker.generation
+                    and cache_key is not None
+                    and cache_version == self._cache_versions.get(name, 0)
+                ):
+                    self._cache_store(cache_key, result.data, spec.cache_ttl_s)
+            elif result.error_code is not None and result.error_code in _DEPENDENCY_FAILURE_MESSAGES:
+                breaker.record_failure(generation)
+                failure = ToolFailure(
+                    result.error_code, _DEPENDENCY_FAILURE_MESSAGES[result.error_code], result.retryable,
+                )
+            else:
+                breaker.abandon_probe(generation)
+            stats.consecutive_fails = breaker.fail_count
+
+        if not result.success:
+            stats.failed += 1
+        if failure is not None:
+            await self._apply_fallback(spec, arguments, context, deadline, failure, result)
+            if result.degraded:
+                stats.degraded += 1
+        result.latency_ms = (self._clock() - started) * 1000
+        stats.total_latency_ms += result.latency_ms
+        return result
+
+    async def _execute_attempts(
+        self,
+        registered: RegisteredTool,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        deadline: float | None,
+        *,
+        probe: bool,
+    ) -> ToolResult:
+        spec, stats = registered.spec, registered.stats
+        name = spec.name
         attempts = 0
-        max_attempts = 1 + (spec.max_retries if spec.retry_safe else 0)
+        max_attempts = 1 + (spec.max_retries if spec.retry_safe and not probe else 0)
         last_error_code: str | None = None
         last_error: str | None = None
         last_retryable = False
@@ -690,12 +769,10 @@ class ToolManager:
                 stats.retries += 1
             attempts += 1
             stats.attempts += 1
+            attempt_budget = asyncio.timeout(attempt_timeout)
             try:
-                async with asyncio.timeout(attempt_timeout):
+                async with attempt_budget:
                     data = await self._invoke(spec.handler, copy.deepcopy(arguments), context)
-            except asyncio.CancelledError:
-                # 取消必须原样传播：不写缓存、不当作工具失败计入熔断。
-                raise
             except TimeoutError:
                 stats.timeout += 1
                 last_error_code = ToolErrorCode.TOOL_TIMEOUT.value
@@ -704,37 +781,26 @@ class ToolManager:
                 logger.warning(
                     "工具超时: %s (attempt %s/%s)", name, attempts, max_attempts,
                 )
+                if attempt_budget.expired() and attempt_timeout < spec.timeout_s:
+                    # 阶段预算限制了这次等待，超时后无需用另一只时钟重新判断。
+                    break
             except ToolError as exc:
                 last_error_code = exc.code.value
                 last_error = exc.message
-                last_retryable = exc.retryable and exc.code in {
-                    ToolErrorCode.TOOL_TIMEOUT, ToolErrorCode.TOOL_HANDLER_ERROR,
-                }
+                last_retryable = exc.retryable and last_error_code in _DEPENDENCY_FAILURE_MESSAGES
             except Exception as exc:
                 last_error_code = ToolErrorCode.TOOL_HANDLER_ERROR.value
                 last_error = str(exc) or type(exc).__name__
                 last_retryable = True
                 logger.error("工具执行失败: %s (%s)", name, type(exc).__name__)
             else:
-                latency_ms = (self._clock() - started) * 1000
-                stats.success += 1
-                stats.consecutive_fails = 0
-                stats.total_latency_ms += latency_ms
-                result = ToolResult(
+                return ToolResult(
                     tool_name=name,
                     success=True,
                     usable=True,
                     data=data,
                     attempts=attempts,
-                    latency_ms=latency_ms,
                 )
-                # 与 EchoMind 一致：缓存最终结果；版本变化则不回填。
-                if (
-                    cache_key is not None
-                    and cache_version == self._cache_versions.get(name, 0)
-                ):
-                    self._cache_store(cache_key, data, spec.cache_ttl_s)
-                return result
 
             if not last_retryable or not spec.retry_safe or attempts >= max_attempts:
                 break
@@ -755,10 +821,6 @@ class ToolManager:
                     except TimeoutError:
                         break
 
-        latency_ms = (self._clock() - started) * 1000
-        stats.failed += 1
-        stats.consecutive_fails += 1
-        stats.total_latency_ms += latency_ms
         if last_error_code is None:
             last_error_code = ToolErrorCode.TOOL_DEADLINE_EXCEEDED.value
             last_error = "工具阶段预算已耗尽"
@@ -767,11 +829,36 @@ class ToolManager:
             success=False,
             usable=False,
             attempts=attempts,
-            latency_ms=latency_ms,
             error_code=last_error_code,
             error=last_error,
             retryable=last_retryable and spec.retry_safe,
         )
+
+    async def _apply_fallback(
+        self,
+        spec: ToolSpec,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        deadline: float | None,
+        failure: ToolFailure,
+        result: ToolResult,
+    ) -> None:
+        fallback = spec.fallback
+        if fallback is None:
+            return
+        timeout = self._attempt_timeout(spec, deadline)
+        if timeout <= 0:
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                data = await self._invoke(fallback, copy.deepcopy(arguments), context, failure)
+        except Exception as exc:
+            logger.warning("工具降级失败: %s (%s)", spec.name, type(exc).__name__)
+        else:
+            if data is not None:
+                result.data = data
+                result.usable = True
+                result.degraded = True
 
     def _attempt_timeout(self, spec: ToolSpec, deadline: float | None) -> float:
         """单次尝试的超时：不超过工具自身超时，也不超过剩余阶段预算。"""
@@ -797,14 +884,15 @@ class ToolManager:
 
     async def _invoke(
         self,
-        handler: Callable[[dict[str, Any], ToolContext], Any],
+        handler: Callable[..., Any],
         params: dict[str, Any],
         context: ToolContext,
+        *args: Any,
     ) -> Any:
         """同步 handler 在线程池执行；超时/取消只停止等待，不能终止线程。"""
         if inspect.iscoroutinefunction(handler):
-            return await handler(params, context)
-        result = await asyncio.to_thread(handler, params, context)
+            return await handler(params, context, *args)
+        result = await asyncio.to_thread(handler, params, context, *args)
         if inspect.isawaitable(result):
             return await result
         return result
@@ -823,6 +911,8 @@ class ToolManager:
                 "timeout": registered.stats.timeout,
                 "cache_hits": registered.stats.cache_hits,
                 "retries": registered.stats.retries,
+                "circuit_rejections": registered.stats.circuit_rejections,
+                "degraded": registered.stats.degraded,
                 "success_rate": round(registered.stats.success_rate, 3),
                 "avg_latency_ms": round(registered.stats.avg_latency_ms, 1),
                 "consecutive_fails": registered.stats.consecutive_fails,
@@ -839,6 +929,8 @@ class ToolManager:
             sleep=self._sleep,
             max_schema_hint_chars=self._max_schema_hint_chars,
             cache_max_entries=self._cache_max_entries,
+            circuit_failure_threshold=self._circuit_failure_threshold,
+            circuit_recovery_s=self._circuit_recovery_s,
         )
         other._cache_versions = {}
         for name, registered in self._tools.items():
