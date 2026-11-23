@@ -1,6 +1,6 @@
 """最小 LLM 客户端封装。
 
-把单条用户消息或摘要任务发给 Anthropic 兼容接口，并返回纯文本。
+支持 Anthropic 兼容的文本对话和带工具的结构化消息。
 
 - 统一超时：SDK 超时 + `asyncio.timeout` 双保险。
 - 统一错误：把 Anthropic SDK 的异常转换成带 HTTP 状态码的 `LLMError`，
@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from collections.abc import Sequence
+import json
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import aclosing
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -43,6 +45,89 @@ class ChatResult:
     text: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUse:
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageTurn:
+    """模型的一轮回复。content 可直接回传为 assistant 消息。"""
+
+    content: list[dict[str, Any]]
+    text: str
+    tool_uses: tuple[ToolUse, ...]
+    stop_reason: str | None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+
+def _tool_options(
+    tools: Sequence[dict[str, Any]] | None, tool_choice: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not tools:
+        if tool_choice is not None:
+            raise ValueError("tool_choice 需要同时提供 tools")
+        return {}
+    options: dict[str, Any] = {"tools": list(tools)}
+    if tool_choice is not None:
+        options["tool_choice"] = tool_choice
+    return options
+
+
+def _parse_message_turn(response: Any) -> MessageTurn:
+    content: list[dict[str, Any]] = []
+    tool_uses: list[ToolUse] = []
+    ids: set[str] = set()
+    stop_reason = _field(response, "stop_reason")
+    raw = _field(response, "content")
+    if not isinstance(raw, (list, tuple)):
+        raise LLMError("模型返回了无效的消息内容", status_code=502, code="tool_protocol_error")
+
+    for block in raw:
+        if isinstance(block, Mapping):
+            payload = deepcopy(dict(block))
+        elif callable(getattr(block, "model_dump", None)):
+            payload = block.model_dump(mode="json", exclude_unset=True)
+        else:
+            # 兼容只暴露属性的上游适配器和测试替身。
+            payload = vars(block).copy() if hasattr(block, "__dict__") else {}
+        kind = payload.get("type")
+        if not isinstance(kind, str) or not kind:
+            raise LLMError("模型返回了无效的消息块", status_code=502, code="tool_protocol_error")
+        if kind == "tool_use":
+            call_id, name, arguments = (payload.get(key) for key in ("id", "name", "input"))
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = None
+            if (
+                not isinstance(call_id, str) or not call_id.strip() or call_id in ids
+                or not isinstance(name, str) or not name.strip()
+                or not isinstance(arguments, dict)
+                or stop_reason == "max_tokens"
+            ):
+                raise LLMError("模型返回了无效的工具调用", status_code=502, code="tool_protocol_error")
+            ids.add(call_id)
+            payload["input"] = deepcopy(arguments)
+            tool_uses.append(ToolUse(call_id, name, deepcopy(arguments)))
+        content.append(payload)
+
+    text = extract_text_content(content)
+    if stop_reason == "tool_use" and not tool_uses:
+        raise LLMError("模型未返回工具调用块", status_code=502, code="tool_protocol_error")
+    if not text and not tool_uses:
+        raise LLMError("模型返回了空内容，请稍后重试", status_code=502, code="llm_empty_response")
+    return MessageTurn(content, text, tuple(tool_uses), stop_reason, *_usage_tokens(_field(response, "usage")))
 
 
 def _build_messages(
@@ -140,13 +225,28 @@ class LLMClient:
     ) -> AsyncIterator[str]:
         """Yield text deltas; cancellation closes the upstream Anthropic stream."""
         messages = _build_messages(message, history)
+        async with aclosing(self.stream_message(messages=messages, system=system)) as stream:
+            async for text in stream:
+                yield text
+
+    async def stream_message(
+        self,
+        *,
+        messages: Sequence[dict[str, Any]],
+        system: str | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]:
+        """在已有 tool_use / tool_result 上下文中流式生成最终文本。"""
+        options = _tool_options(tools, tool_choice)
         try:
             async with asyncio.timeout(self.settings.timeout_s):
                 async with self._client.messages.stream(
                     model=self.settings.model,
                     max_tokens=self.settings.max_tokens,
                     system=system or SYSTEM_PROMPT,
-                    messages=messages,
+                    messages=list(messages),
+                    **options,
                 ) as stream:
                     async for text in stream.text_stream:
                         if text:
@@ -195,13 +295,44 @@ class LLMClient:
         system: str,
         reject_truncated: bool = False,
     ) -> ChatResult:
+        response = await self._request_message(messages=messages, system=system)
+        if reject_truncated and getattr(response, "stop_reason", None) == "max_tokens":
+            raise LLMError("摘要输出被截断", code="summary_truncated")
+        text = extract_text_content(getattr(response, "content", []))
+        if not text:
+            raise LLMError(
+                "模型返回了空内容，请稍后重试",
+                status_code=502,
+                code="llm_empty_response",
+            )
+        input_tokens, output_tokens = _usage_tokens(getattr(response, "usage", None))
+        return ChatResult(text=text, input_tokens=input_tokens, output_tokens=output_tokens)
+
+    async def create_message(
+        self,
+        *,
+        messages: Sequence[dict[str, Any]],
+        system: str | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
+    ) -> MessageTurn:
+        """执行一次非流式模型请求，保留原生 content block 和结构化调用。"""
+        response = await self._request_message(
+            messages=list(messages), system=system or SYSTEM_PROMPT, **_tool_options(tools, tool_choice),
+        )
+        return _parse_message_turn(response)
+
+    async def _request_message(
+        self, *, messages: list[dict[str, Any]], system: str, **options: Any,
+    ) -> Any:
         try:
             async with asyncio.timeout(self.settings.timeout_s):
-                response = await self._client.messages.create(
+                return await self._client.messages.create(
                     model=self.settings.model,
                     max_tokens=self.settings.max_tokens,
                     system=system,
                     messages=messages,
+                    **options,
                 )
         except (asyncio.TimeoutError, anthropic.APITimeoutError) as ex:
             raise LLMError(
@@ -251,15 +382,3 @@ class LLMClient:
                 status_code=502,
                 code="llm_api_error",
             ) from ex
-
-        if reject_truncated and getattr(response, "stop_reason", None) == "max_tokens":
-            raise LLMError("摘要输出被截断", code="summary_truncated")
-        text = extract_text_content(getattr(response, "content", []))
-        if not text:
-            raise LLMError(
-                "模型返回了空内容，请稍后重试",
-                status_code=502,
-                code="llm_empty_response",
-            )
-        input_tokens, output_tokens = _usage_tokens(getattr(response, "usage", None))
-        return ChatResult(text=text, input_tokens=input_tokens, output_tokens=output_tokens)
