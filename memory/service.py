@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -178,24 +179,26 @@ class ConversationMemory:
         lock_held: bool = False,
         state: dict[str, Any] | None = None,
     ) -> Turn | None:
-        """提交成功后触发后台压缩；不等待摘要，不阻塞聊天。"""
-        turn = await self.store.commit_turn(
-            user_id,
-            session_id,
-            request_id=request_id,
-            user_message=question,
-            assistant_message=answer,
-            succeeded=succeeded,
-            client_request_id=client_request_id,
-            lock_held=lock_held,
-            state=state,
-        )
-        if turn is not None and self.maintainer is not None:
-            try:
-                self.maintainer.submit(user_id, session_id)
-            except Exception:  # 维护失败不影响已保存的问答
-                logger.warning("提交记忆维护任务失败", exc_info=True)
-        return turn
+        """持锁保存问答、状态和回执，再提交后台维护；不等待维护执行。"""
+        # 调用方未持锁时，由本层持锁到维护提交结束，避免保存后提前解锁。
+        async with self.conversation(user_id, session_id) if succeeded and not lock_held else nullcontext():
+            turn = await self.store.commit_turn(
+                user_id,
+                session_id,
+                request_id=request_id,
+                user_message=question,
+                assistant_message=answer,
+                succeeded=succeeded,
+                client_request_id=client_request_id,
+                lock_held=True,
+                state=state,
+            )
+            if turn is not None and self.maintainer is not None:
+                try:
+                    self.maintainer.submit(user_id, session_id)
+                except Exception:  # 维护失败不影响已保存的问答
+                    logger.warning("提交记忆维护任务失败", exc_info=True)
+            return turn
 
     async def health(self) -> MemoryHealth:
         detail: list[str] = []
