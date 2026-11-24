@@ -128,6 +128,146 @@ class KnowledgeBase:
 
         return await asyncio.to_thread(self.add_documents, documents)
 
+    def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """按语义相似度检索片段，score 越高越相关。"""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query 不能为空")
+        if type(top_k) is not int or not 1 <= top_k <= 20:
+            raise ValueError("top_k 必须是 1 到 20 的整数")
+        count = self._collection.count()
+        if count == 0:
+            return []
+        result = self._collection.query(
+            query_texts=[query.strip()],
+            n_results=min(top_k, count),
+            include=["documents", "metadatas", "distances"],
+        )
+        documents = (result.get("documents") or [[]])[0] or []
+        metadatas = (result.get("metadatas") or [[]])[0] or []
+        distances = (result.get("distances") or [[]])[0] or []
+        return [
+            {
+                "title": (metadata or {}).get("title", ""),
+                "content": content,
+                "score": round(1.0 - float(distance), 4),
+                "document_id": (metadata or {}).get("document_id", ""),
+                "version": (metadata or {}).get("version", ""),
+                "chunk_index": (metadata or {}).get("chunk_index", 0),
+                "total_chunks": (metadata or {}).get("total_chunks", 1),
+            }
+            for content, metadata, distance in zip(documents, metadatas, distances)
+        ]
+
+    async def search_async(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """在线程池中调用同步 Chroma 查询。"""
+        import asyncio
+
+        return await asyncio.to_thread(self.search, query, top_k)
+
+    def list_documents(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        """按文档聚合并分页列出知识库文档。"""
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit 必须是 1 到 200 的整数")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset 必须是非负整数")
+        total_chunks = self._collection.count()
+        if not total_chunks:
+            return []
+        result = self._collection.get(
+            include=["documents", "metadatas"], limit=total_chunks,
+        )
+        grouped = self._group_chunks(result)
+        ordered = sorted(grouped.values(), key=lambda item: (item["title"].casefold(), item["document_id"]))
+        return ordered[offset:offset + limit]
+
+    async def list_documents_async(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        import asyncio
+
+        return await asyncio.to_thread(self.list_documents, limit=limit, offset=offset)
+
+    def get_document(self, document_id: str) -> dict[str, Any] | None:
+        """读取一个文档的元数据与按序片段；未知 ID 返回 None。"""
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 不能为空")
+        result = self._collection.get(
+            where={"document_id": document_id.strip()}, include=["documents", "metadatas"],
+        )
+        grouped = self._group_chunks(result)
+        return grouped.get(document_id.strip())
+
+    async def get_document_async(self, document_id: str) -> dict[str, Any] | None:
+        import asyncio
+
+        return await asyncio.to_thread(self.get_document, document_id)
+
+    def delete_document(self, document_id: str) -> bool:
+        """删除指定文档的全部片段，返回是否找到并删除文档。"""
+        if not isinstance(document_id, str) or not document_id.strip():
+            raise ValueError("document_id 不能为空")
+        document_id = document_id.strip()
+        with self._write_lock:
+            result = self._collection.get(
+                where={"document_id": document_id}, include=["metadatas"],
+            )
+            ids = result.get("ids", [])
+            if not ids:
+                return False
+            self._collection.delete(ids=ids)
+            return True
+
+    async def delete_document_async(self, document_id: str) -> bool:
+        import asyncio
+
+        return await asyncio.to_thread(self.delete_document, document_id)
+
+    def stats(self) -> dict[str, int]:
+        """返回文档数和片段数，二者分别统计。"""
+        total_chunks = self._collection.count()
+        if not total_chunks:
+            return {"document_count": 0, "chunk_count": 0}
+        result = self._collection.get(
+            include=["metadatas"], limit=total_chunks,
+        )
+        document_ids = {
+            metadata.get("document_id")
+            for metadata in result.get("metadatas", [])
+            if metadata and metadata.get("document_id")
+        }
+        return {"document_count": len(document_ids), "chunk_count": total_chunks}
+
+    async def stats_async(self) -> dict[str, int]:
+        import asyncio
+
+        return await asyncio.to_thread(self.stats)
+
+    @staticmethod
+    def _group_chunks(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        for content, metadata in zip(documents, metadatas):
+            metadata = metadata or {}
+            document_id = metadata.get("document_id")
+            if not document_id:
+                continue
+            entry = grouped.setdefault(document_id, {
+                "document_id": document_id,
+                "title": metadata.get("title", ""),
+                "version": metadata.get("version", ""),
+                "imported_at": metadata.get("imported_at", ""),
+                "chunk_count": 0,
+                "chunks": [],
+            })
+            entry["chunks"].append({
+                "content": content,
+                "chunk_index": metadata.get("chunk_index", 0),
+                "total_chunks": metadata.get("total_chunks", 1),
+            })
+            entry["chunk_count"] += 1
+        for entry in grouped.values():
+            entry["chunks"].sort(key=lambda chunk: chunk["chunk_index"])
+        return grouped
+
     def _chunk_text(self, text: str) -> list[str]:
         """按段落和句子尽量保持语义边界，超长句硬切并支持字符重叠。"""
         size = self.settings.chunk_size

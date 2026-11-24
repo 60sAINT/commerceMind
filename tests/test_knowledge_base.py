@@ -14,14 +14,26 @@ class FakeCollection:
     def __init__(self):
         self.rows: dict[str, tuple[str, dict]] = {}
         self.upsert_calls: list[dict] = []
+        self.query_calls: list[dict] = []
 
-    def get(self, *, where, include):
+    def count(self):
+        return len(self.rows)
+
+    def get(self, *, where=None, include, limit=None):
         rows = [
             (doc_id, metadata)
             for doc_id, (_, metadata) in self.rows.items()
-            if all(metadata.get(key) == value for key, value in where.items())
+            if where is None or all(metadata.get(key) == value for key, value in where.items())
         ]
-        return {"ids": [row[0] for row in rows], "metadatas": [row[1] for row in rows]}
+        if limit is not None:
+            rows = rows[:limit]
+        selected = {row[0]: (self.rows[row[0]][0], row[1]) for row in rows}
+        result = {"ids": list(selected)}
+        if "metadatas" in include:
+            result["metadatas"] = [row[1] for row in selected.values()]
+        if "documents" in include:
+            result["documents"] = [row[0] for row in selected.values()]
+        return result
 
     def upsert(self, *, ids, documents, metadatas):
         self.upsert_calls.append({"ids": ids, "documents": documents, "metadatas": metadatas})
@@ -31,6 +43,15 @@ class FakeCollection:
     def delete(self, *, ids):
         for doc_id in ids:
             self.rows.pop(doc_id, None)
+
+    def query(self, **kwargs):
+        self.query_calls.append(kwargs)
+        selected = list(self.rows.items())[:kwargs["n_results"]]
+        return {
+            "documents": [[content for _, (content, _) in selected]],
+            "metadatas": [[metadata for _, (_, metadata) in selected]],
+            "distances": [[index / 10 for index in range(len(selected))]],
+        }
 
 
 def make_kb(**settings):
@@ -140,3 +161,54 @@ def test_import_rejects_invalid_documents(document):
 def test_chunk_configuration_validates_overlap():
     with pytest.raises(ValueError, match="OVERLAP"):
         KnowledgeBaseSettings(chunk_size=10, chunk_overlap=10)
+
+
+def test_search_validates_query_and_top_k_and_maps_similarity_results():
+    kb = make_kb()
+    kb.add_documents([{"document_id": "a", "title": "退款", "content": "退款规则"}])
+
+    result = kb.search("  怎么退款  ", top_k=4)
+
+    assert result[0]["score"] == 1.0
+    assert result[0]["document_id"] == next(iter(kb._collection.rows.values()))[1]["document_id"]
+    assert kb._collection.query_calls[0]["query_texts"] == ["怎么退款"]
+    with pytest.raises(ValueError, match="top_k"):
+        kb.search("退款", top_k=True)
+    with pytest.raises(ValueError, match="query"):
+        kb.search(" ")
+
+
+def test_search_empty_collection_returns_empty_without_query():
+    kb = make_kb()
+
+    assert kb.search("查询") == []
+    assert kb._collection.query_calls == []
+
+
+def test_document_list_detail_stats_and_delete_operate_on_documents():
+    kb = make_kb(chunk_size=8, chunk_overlap=0)
+    kb.add_documents([
+        {"document_id": "b", "title": "乙文档", "content": "乙内容较长会分片扩展"},
+        {"document_id": "a", "title": "甲文档", "content": "甲文档正文"},
+    ])
+
+    stats = kb.stats()
+    docs = kb.list_documents(limit=1)
+    detail = kb.get_document("b")
+    assert stats == {"document_count": 2, "chunk_count": 3}
+    assert len(docs) == 1 and docs[0]["document_id"] == "a"
+    assert detail and detail["chunk_count"] == 2
+    assert [chunk["chunk_index"] for chunk in detail["chunks"]] == [0, 1]
+    assert kb.get_document("missing") is None
+    assert kb.delete_document("b") is True
+    assert kb.delete_document("b") is False
+    assert kb.stats() == {"document_count": 1, "chunk_count": 1}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"limit": 0}, {"limit": 201}, {"offset": -1},
+])
+def test_list_documents_validates_pagination(kwargs):
+    kb = make_kb()
+    with pytest.raises(ValueError):
+        kb.list_documents(**kwargs)
