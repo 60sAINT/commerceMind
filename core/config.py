@@ -109,6 +109,33 @@ class MemorySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeBaseSettings:
+    """RAG 知识库的 Chroma collection 配置，与记忆 collection 分离。"""
+
+    enabled: bool = False
+    required: bool = False
+    chroma_host: str = "localhost"
+    chroma_port: int = 8001
+    collection_name: str = "knowledge_base"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "chroma_host", (self.chroma_host or "").strip())
+        object.__setattr__(self, "collection_name", (self.collection_name or "").strip())
+        if self.required and not self.enabled:
+            raise ValueError("知识库 required 为 true 时必须同时 enabled")
+        if self.enabled and not self.chroma_host:
+            raise ValueError("COMMERCEMIND_KNOWLEDGE_ENABLED=true 时 CHROMA_HOST 不能为空")
+        if type(self.chroma_port) is not int or not 0 < self.chroma_port < 65536:
+            raise ValueError("知识库 CHROMA_PORT 必须是合法端口")
+        if not 3 <= len(self.collection_name) <= 63:
+            raise ValueError("COMMERCEMIND_KNOWLEDGE_COLLECTION 必须为 3 到 63 个字符")
+        if not self.collection_name[0].isalnum() or not self.collection_name[-1].isalnum():
+            raise ValueError("知识库 collection 名称必须以字母或数字开头和结尾")
+        if any(not (char in "abcdefghijklmnopqrstuvwxyz0123456789._-") for char in self.collection_name):
+            raise ValueError("知识库 collection 名称只允许小写字母、数字、点、下划线和连字符")
+
+
+@dataclass(frozen=True, slots=True)
 class IntentSettings:
     """三路意图识别参数；关闭时不影响现有聊天路径。"""
 
@@ -289,6 +316,7 @@ class Settings:
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_tokens: int = DEFAULT_MAX_TOKENS
     memory: MemorySettings = field(default_factory=MemorySettings)
+    knowledge: KnowledgeBaseSettings = field(default_factory=KnowledgeBaseSettings)
     intent: IntentSettings = field(default_factory=IntentSettings)
     skills: SkillSettings = field(default_factory=SkillSettings)
     tools: ToolSettings = field(default_factory=ToolSettings)
@@ -338,6 +366,13 @@ class Settings:
                 chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                 chroma_port=_env_int("CHROMA_PORT", 8001),
                 debug=_env_bool("COMMERCEMIND_MEMORY_DEBUG", False),
+            ),
+            knowledge=KnowledgeBaseSettings(
+                enabled=_env_bool("COMMERCEMIND_KNOWLEDGE_ENABLED", False),
+                required=_env_bool("COMMERCEMIND_KNOWLEDGE_REQUIRED", False),
+                chroma_host=os.getenv("CHROMA_HOST", "localhost"),
+                chroma_port=_env_int("CHROMA_PORT", 8001),
+                collection_name=os.getenv("COMMERCEMIND_KNOWLEDGE_COLLECTION", "knowledge_base"),
             ),
             intent=IntentSettings(
                 enabled=_env_bool("COMMERCEMIND_INTENT_ENABLED", False),
