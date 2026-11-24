@@ -117,6 +117,9 @@ class KnowledgeBaseSettings:
     chroma_host: str = "localhost"
     chroma_port: int = 8001
     collection_name: str = "knowledge_base"
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    write_batch_size: int = 100
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "chroma_host", (self.chroma_host or "").strip())
@@ -133,6 +136,12 @@ class KnowledgeBaseSettings:
             raise ValueError("知识库 collection 名称必须以字母或数字开头和结尾")
         if any(not (char in "abcdefghijklmnopqrstuvwxyz0123456789._-") for char in self.collection_name):
             raise ValueError("知识库 collection 名称只允许小写字母、数字、点、下划线和连字符")
+        if type(self.chunk_size) is not int or self.chunk_size <= 0:
+            raise ValueError("COMMERCEMIND_KNOWLEDGE_CHUNK_SIZE 必须是正整数")
+        if type(self.chunk_overlap) is not int or not 0 <= self.chunk_overlap < self.chunk_size:
+            raise ValueError("COMMERCEMIND_KNOWLEDGE_CHUNK_OVERLAP 必须是非负整数且小于 chunk_size")
+        if type(self.write_batch_size) is not int or self.write_batch_size <= 0:
+            raise ValueError("COMMERCEMIND_KNOWLEDGE_WRITE_BATCH_SIZE 必须是正整数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +382,9 @@ class Settings:
                 chroma_host=os.getenv("CHROMA_HOST", "localhost"),
                 chroma_port=_env_int("CHROMA_PORT", 8001),
                 collection_name=os.getenv("COMMERCEMIND_KNOWLEDGE_COLLECTION", "knowledge_base"),
+                chunk_size=_env_int("COMMERCEMIND_KNOWLEDGE_CHUNK_SIZE", 500),
+                chunk_overlap=_env_non_negative_int("COMMERCEMIND_KNOWLEDGE_CHUNK_OVERLAP", 50),
+                write_batch_size=_env_int("COMMERCEMIND_KNOWLEDGE_WRITE_BATCH_SIZE", 100),
             ),
             intent=IntentSettings(
                 enabled=_env_bool("COMMERCEMIND_INTENT_ENABLED", False),

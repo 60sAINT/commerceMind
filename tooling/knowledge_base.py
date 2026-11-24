@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import re
+import threading
+from datetime import datetime, timezone
 from typing import Any
 
 from core.config import KnowledgeBaseSettings
@@ -16,6 +21,7 @@ class KnowledgeBase:
         if not settings.enabled:
             raise RuntimeError("知识库未启用，请设置 COMMERCEMIND_KNOWLEDGE_ENABLED=true")
         self.settings = settings
+        self._write_lock = threading.RLock()
         self._client = client
         try:
             if self._client is None:
@@ -61,4 +67,109 @@ class KnowledgeBase:
         close = getattr(self._client, "close", None)
         if callable(close):
             close()
+
+    def add_documents(self, documents: list[dict[str, str]]) -> int:
+        """导入或替换文档，返回本次写入的片段数。相同身份可安全重复导入。"""
+        if not isinstance(documents, list):
+            raise ValueError("documents 必须是列表")
+        prepared: dict[str, tuple[str, str]] = {}
+        for index, document in enumerate(documents):
+            if not isinstance(document, dict):
+                raise ValueError(f"documents[{index}] 必须是对象")
+            title, content = document.get("title"), document.get("content")
+            document_id = document.get("document_id")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError(f"documents[{index}].title 不能为空")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"documents[{index}].content 不能为空")
+            if document_id is not None and (not isinstance(document_id, str) or not document_id.strip()):
+                raise ValueError(f"documents[{index}].document_id 必须是非空字符串")
+            title = title.strip()
+            content = content.strip()
+            identity = ["id", document_id.strip()] if document_id else ["title", title]
+            key = hashlib.sha256(json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+            prepared[key] = (title, content)
+
+        written = 0
+        with self._write_lock:
+            for document_id, (title, content) in prepared.items():
+                version = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                chunks = self._chunk_text(content)
+                ids = [f"{document_id}:{index}" for index in range(len(chunks))]
+                existing = self._collection.get(
+                    where={"document_id": document_id}, include=["metadatas"],
+                )
+                old_ids = set(existing.get("ids", []))
+                imported_at = datetime.now(timezone.utc).isoformat()
+                for offset in range(0, len(chunks), self.settings.write_batch_size):
+                    batch_chunks = chunks[offset:offset + self.settings.write_batch_size]
+                    batch_ids = ids[offset:offset + self.settings.write_batch_size]
+                    self._collection.upsert(
+                        ids=batch_ids,
+                        documents=batch_chunks,
+                        metadatas=[{
+                            "title": title,
+                            "document_id": document_id,
+                            "version": version,
+                            "chunk_index": offset + index,
+                            "total_chunks": len(chunks),
+                            "imported_at": imported_at,
+                        } for index in range(len(batch_chunks))],
+                    )
+                stale_ids = old_ids - set(ids)
+                if stale_ids:
+                    self._collection.delete(ids=list(stale_ids))
+                written += len(chunks)
+        return written
+
+    async def add_documents_async(self, documents: list[dict[str, str]]) -> int:
+        """异步 API 适配器；Chroma 客户端为同步实现。"""
+        import asyncio
+
+        return await asyncio.to_thread(self.add_documents, documents)
+
+    def _chunk_text(self, text: str) -> list[str]:
+        """按段落和句子尽量保持语义边界，超长句硬切并支持字符重叠。"""
+        size = self.settings.chunk_size
+        overlap = self.settings.chunk_overlap
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        paragraphs = [re.sub(r"[ \t]+", " ", part).strip() for part in normalized.split("\n")]
+        sentences: list[str] = []
+        for paragraph in paragraphs:
+            if not paragraph:
+                continue
+            parts = re.split(r"(?<=[。！？.!?；;])", paragraph)
+            for part in parts:
+                part = part.strip()
+                while len(part) > size:
+                    sentences.append(part[:size])
+                    part = part[max(0, size - overlap):]
+                if part:
+                    sentences.append(part)
+
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            remaining = sentence
+            while remaining:
+                separator = " " if current else ""
+                available = size - len(current) - len(separator)
+                if available <= 0:
+                    chunks.append(current)
+                    current = current[-overlap:] if overlap else ""
+                    continue
+                if len(remaining) <= available:
+                    current += separator + remaining
+                    break
+                if current and len(current) > overlap:
+                    chunks.append(current)
+                    current = current[-overlap:] if overlap else ""
+                    continue
+                current += separator + remaining[:available]
+                remaining = remaining[available:]
+                chunks.append(current)
+                current = current[-overlap:] if overlap else ""
+        if current:
+            chunks.append(current)
+        return chunks
 

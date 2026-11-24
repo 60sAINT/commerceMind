@@ -41,6 +41,9 @@ def test_settings_from_env_reads_knowledge_configuration(monkeypatch):
     monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_ENABLED", "true")
     monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_REQUIRED", "true")
     monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_COLLECTION", "commerce_docs")
+    monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_CHUNK_SIZE", "800")
+    monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_CHUNK_OVERLAP", "80")
+    monkeypatch.setenv("COMMERCEMIND_KNOWLEDGE_WRITE_BATCH_SIZE", "20")
     monkeypatch.setenv("CHROMA_HOST", "chroma-service")
     monkeypatch.setenv("CHROMA_PORT", "8123")
 
@@ -50,6 +53,9 @@ def test_settings_from_env_reads_knowledge_configuration(monkeypatch):
     assert settings.chroma_host == "chroma-service"
     assert settings.chroma_port == 8123
     assert settings.collection_name == "commerce_docs"
+    assert settings.chunk_size == 800
+    assert settings.chunk_overlap == 80
+    assert settings.write_batch_size == 20
 
 
 def test_knowledge_base_initializes_named_collection_and_closes_client():
