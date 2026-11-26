@@ -15,6 +15,7 @@ class FakeCollection:
         self.rows: dict[str, tuple[str, dict]] = {}
         self.upsert_calls: list[dict] = []
         self.query_calls: list[dict] = []
+        self.metadata = {"hnsw:space": "cosine"}
 
     def count(self):
         return len(self.rows)

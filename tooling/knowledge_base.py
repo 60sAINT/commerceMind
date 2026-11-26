@@ -36,7 +36,10 @@ class KnowledgeBase:
             self._client.heartbeat()
             self._collection = self._client.get_or_create_collection(
                 name=settings.collection_name,
-                metadata={"description": "CommerceMind RAG knowledge base"},
+                metadata={
+                    "description": "CommerceMind RAG knowledge base",
+                    "hnsw:space": "cosine",
+                },
             )
         except Exception as exc:
             close = getattr(self._client, "close", None)
@@ -145,11 +148,15 @@ class KnowledgeBase:
         documents = (result.get("documents") or [[]])[0] or []
         metadatas = (result.get("metadatas") or [[]])[0] or []
         distances = (result.get("distances") or [[]])[0] or []
+        metric = (getattr(self._collection, "metadata", None) or {}).get("hnsw:space", "l2")
         return [
             {
                 "title": (metadata or {}).get("title", ""),
                 "content": content,
-                "score": round(1.0 - float(distance), 4),
+                "score": round(
+                    1.0 - float(distance) if metric == "cosine" else 1.0 / (1.0 + float(distance)),
+                    4,
+                ),
                 "document_id": (metadata or {}).get("document_id", ""),
                 "version": (metadata or {}).get("version", ""),
                 "chunk_index": (metadata or {}).get("chunk_index", 0),

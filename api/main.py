@@ -5,6 +5,7 @@
     GET  /health  -> 检查服务、模型和记忆依赖（Redis/Chroma）
     POST /chat/stream -> SSE：记忆 / 意图 / Skills -> 可选工具循环 -> 最终回答 -> 提交本轮
     GET  /skills  -> Skill 轻量目录
+    /knowledge/* -> 知识库状态、文档管理和语义检索
     POST /skills/reload -> 热重载；POST /skills/import -> 导入技能包（均需 Skills debug 开启）
     GET/PUT /skills/{id}/files；DELETE /skills/{id} -> 文件管理（同样需 debug）
 
@@ -25,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from core.config import Settings
+from core.config import KnowledgeBaseSettings, Settings
 from core.conversation_state import BusinessTurn, merge_business_state
 from core.intent import IntentSource
 from core.intent_embedding import IntentEmbeddingMatcher
@@ -50,6 +51,7 @@ from memory.service import ConversationMemory, MemoryHealth
 from api.sessions import SessionRepository
 from tooling import FunctionCallingLoop, ToolContext, ToolManager, build_commerce_tools, build_reranker
 from monitor.tool_monitor import ToolMonitor, prometheus_metrics
+from tooling.knowledge_base import KnowledgeBase
 
 load_dotenv()
 
@@ -89,6 +91,46 @@ class SkillImportRequest(BaseModel):
 class SkillSaveRequest(BaseModel):
     revision: str = Field(min_length=64, max_length=64)
     files: list[SkillImportFileModel] = Field(min_length=1, max_length=256)
+
+
+class KnowledgeDocumentInput(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=256)
+    content: str = Field(min_length=1, max_length=100_000)
+
+    @field_validator("document_id", "title", "content")
+    @classmethod
+    def strip_knowledge_fields(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+
+class KnowledgeImportRequest(BaseModel):
+    documents: list[KnowledgeDocumentInput] = Field(min_length=1, max_length=20)
+
+    @field_validator("documents")
+    @classmethod
+    def limit_total_content(cls, value: list[KnowledgeDocumentInput]) -> list[KnowledgeDocumentInput]:
+        if sum(len(item.title) + len(item.content) for item in value) > 500_000:
+            raise ValueError("单次导入总字符数不能超过 500000")
+        return value
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=4000)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("query")
+    @classmethod
+    def strip_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("query 不能为空")
+        return value
 
 
 class ChatRequest(BaseModel):
@@ -231,16 +273,18 @@ def create_app(
     *,
     memory: ConversationMemory | None = None,
     llm: LLMClient | None = None,
+    knowledge: KnowledgeBase | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用；可注入独立配置、记忆服务和 LLM。"""
     settings = settings or Settings.from_env()
     llm = llm or (LLMClient(settings) if settings.model_configured else None)
     started_memory: ConversationMemory | None = None
     started_sessions: SessionRepository | None = None
+    started_knowledge: KnowledgeBase | None = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        nonlocal started_memory, started_sessions
+        nonlocal started_memory, started_sessions, started_knowledge
         database_url = os.getenv("DATABASE_URL", "").strip()
         if database_url:
             started_sessions = await SessionRepository.connect(database_url)
@@ -258,6 +302,26 @@ def create_app(
                 logger.warning(
                     "记忆初始化失败，按无记忆模式运行: %s", type(exc).__name__,
                 )
+        if settings.knowledge.enabled and app.state.knowledge is None:
+            try:
+                started_knowledge = KnowledgeBase.from_settings(settings.knowledge)
+                app.state.knowledge = started_knowledge
+            except Exception as exc:
+                if settings.knowledge.required:
+                    if started_memory is not None:
+                        try:
+                            await started_memory.close()
+                        except Exception:
+                            logger.warning("知识库启动失败后关闭记忆服务失败", exc_info=True)
+                    if started_sessions is not None:
+                        try:
+                            await started_sessions.close()
+                        except Exception:
+                            logger.warning("知识库启动失败后关闭会话存储失败", exc_info=True)
+                    raise RuntimeError(
+                        "知识库依赖不可用，且 COMMERCEMIND_KNOWLEDGE_REQUIRED=true"
+                    ) from exc
+                logger.warning("知识库初始化失败，管理 API 将返回不可用: %s", type(exc).__name__)
         try:
             yield
         finally:
@@ -266,6 +330,11 @@ def create_app(
                     await started_memory.close()
                 except Exception:
                     logger.warning("关闭记忆服务失败", exc_info=True)
+            if started_knowledge is not None:
+                try:
+                    started_knowledge.close()
+                except Exception:
+                    logger.warning("关闭知识库客户端失败", exc_info=True)
             if started_sessions is not None:
                 await started_sessions.close()
 
@@ -279,6 +348,7 @@ def create_app(
     app.state.settings = settings
     app.state.llm = llm
     app.state.memory = memory
+    app.state.knowledge = knowledge
     app.state.sessions = None
     app.state.skill_manager = None
     app.state.tool_manager = None
@@ -323,6 +393,116 @@ def create_app(
                 "limits": {"max_file_bytes": settings.skills.upload_max_file_bytes,
                            "max_total_bytes": settings.skills.upload_max_total_bytes,
                            "max_files": settings.skills.upload_max_files}}
+
+    def require_knowledge() -> KnowledgeBase:
+        manager = app.state.knowledge
+        if not settings.knowledge.enabled or manager is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "knowledge_unavailable", "message": "知识库当前不可用"},
+            )
+        return manager
+
+    @app.get("/knowledge/stats", tags=["知识库"])
+    async def knowledge_stats() -> dict[str, int]:
+        manager = require_knowledge()
+        try:
+            return await manager.stats_async()
+        except Exception as exc:
+            logger.exception("知识库统计失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
+
+    @app.get("/knowledge/documents", tags=["知识库"])
+    async def knowledge_documents(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        manager = require_knowledge()
+        try:
+            items = await manager.list_documents_async(limit=limit, offset=offset)
+            stats = await manager.stats_async()
+            return {"items": items, "total": stats["document_count"], "limit": limit, "offset": offset}
+        except Exception as exc:
+            logger.exception("知识库文档列表读取失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
+
+    @app.post("/knowledge/documents", tags=["知识库"])
+    async def import_knowledge_documents(body: KnowledgeImportRequest) -> dict[str, Any]:
+        manager = require_knowledge()
+        try:
+            count = await manager.add_documents_async([
+                document.model_dump(exclude_none=True) for document in body.documents
+            ])
+            return {"imported_chunks": count, "stats": await manager.stats_async()}
+        except Exception as exc:
+            logger.exception("知识库文档导入失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
+
+    @app.get("/knowledge/documents/{document_id}", tags=["知识库"])
+    async def knowledge_document(
+        document_id: str = Path(min_length=1, max_length=128),
+    ) -> dict[str, Any]:
+        manager = require_knowledge()
+        try:
+            document = await manager.get_document_async(document_id)
+        except ValueError as exc:
+            raise HTTPException(422, detail={
+                "error_code": "knowledge_invalid_document_id", "message": str(exc),
+            }) from exc
+        except Exception as exc:
+            logger.exception("知识库文档读取失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
+        if document is None:
+            raise HTTPException(404, detail={
+                "error_code": "knowledge_document_not_found", "message": "知识库文档不存在",
+            })
+        return document
+
+    @app.delete("/knowledge/documents/{document_id}", tags=["知识库"])
+    async def delete_knowledge_document(
+        document_id: str = Path(min_length=1, max_length=128),
+    ) -> dict[str, bool]:
+        manager = require_knowledge()
+        try:
+            deleted = await manager.delete_document_async(document_id)
+        except ValueError as exc:
+            raise HTTPException(422, detail={
+                "error_code": "knowledge_invalid_document_id", "message": str(exc),
+            }) from exc
+        except Exception as exc:
+            logger.exception("知识库文档删除失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
+        if not deleted:
+            raise HTTPException(404, detail={
+                "error_code": "knowledge_document_not_found", "message": "知识库文档不存在",
+            })
+        return {"deleted": True}
+
+    @app.post("/knowledge/search", tags=["知识库"])
+    async def search_knowledge(body: KnowledgeSearchRequest) -> dict[str, Any]:
+        manager = require_knowledge()
+        try:
+            results = await manager.search_async(body.query, top_k=body.top_k)
+            return {"query": body.query, "results": results}
+        except ValueError as exc:
+            raise HTTPException(422, detail={
+                "error_code": "knowledge_invalid_search", "message": str(exc),
+            }) from exc
+        except Exception as exc:
+            logger.exception("知识库检索失败")
+            raise HTTPException(503, detail={
+                "error_code": "knowledge_unavailable", "message": "知识库当前不可用",
+            }) from exc
 
     @app.post("/sessions", tags=["会话"])
     async def create_session(user_id: str = Query(min_length=1, max_length=128)):
